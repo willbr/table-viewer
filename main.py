@@ -49,6 +49,7 @@ class CSVViewer(tk.Tk):
         self.col_widths = {}
         self.total_rows = 0
         self.total_cols = 0
+        self.full_load_complete = False # Flag to track background loading
 
         self.config(bg=self.BACKGROUND_COLOR) # Set root window background
         self._create_menu()
@@ -103,13 +104,13 @@ class CSVViewer(tk.Tk):
         file_menu.add_command(label="Exit", command=self.quit)
         menu_bar.add_cascade(label="File", menu=file_menu)
         
-        edit_menu = tk.Menu(menu_bar, tearoff=0)
-        edit_menu.add_command(label="Find/Filter...", command=self.find_data, accelerator=f"{self.modifier}+F")
-        edit_menu.add_command(label="Clear Filter", command=self.clear_filter, accelerator="Esc")
-        edit_menu.add_command(label="Go to Line...", command=self.go_to_line, accelerator=f"{self.modifier}+G")
-        edit_menu.add_separator()
-        edit_menu.add_command(label="Copy", command=self.copy_selection, accelerator=f"{self.modifier}+C")
-        menu_bar.add_cascade(label="Edit", menu=edit_menu)
+        self.edit_menu = tk.Menu(menu_bar, tearoff=0)
+        self.edit_menu.add_command(label="Find/Filter...", command=self.find_data, accelerator=f"{self.modifier}+F")
+        self.edit_menu.add_command(label="Clear Filter", command=self.clear_filter, accelerator="Esc")
+        self.edit_menu.add_command(label="Go to Line...", command=self.go_to_line, accelerator=f"{self.modifier}+G")
+        self.edit_menu.add_separator()
+        self.edit_menu.add_command(label="Copy", command=self.copy_selection, accelerator=f"{self.modifier}+C")
+        menu_bar.add_cascade(label="Edit", menu=self.edit_menu)
 
         help_menu = tk.Menu(menu_bar, tearoff=0)
         help_menu.add_command(label="About", command=self.show_about)
@@ -204,29 +205,75 @@ class CSVViewer(tk.Tk):
         self.status_bar.config(text=f"Loading {self.file_path}...")
         self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
         self.selected_cell = {'row': None, 'col': None} # Reset selection
+        self.full_load_complete = False
+        self.edit_menu.entryconfig("Find/Filter...", state="disabled")
+
 
         # Use a thread to load the file to prevent the UI from freezing
         thread = threading.Thread(target=self._load_csv_data, daemon=True)
         thread.start()
 
     def _load_csv_data(self):
-        """Loads data from the CSV file in a separate thread."""
+        """
+        Loads data from the CSV file in a separate thread.
+        It loads an initial chunk for immediate display, then reads
+        the rest of the file in the background.
+        """
+        INITIAL_LOAD_ROWS = 2000 # Number of rows to load for initial display
+        UPDATE_INTERVAL_ROWS = 50000 # How often to update the scrollbar during full load
+
         try:
             with open(self.file_path, 'r', encoding='utf-8', errors='replace') as f:
                 reader = csv.reader(f)
                 self.column_names = next(reader, None)
-                if self.column_names:
-                    self.original_data = list(reader)
-                    self.csv_data = self.original_data[:]
-                    self._detect_column_types()
-                    self._estimate_col_widths()
+                if not self.column_names:
+                    self.after(0, lambda: self.status_bar.config(text="File is empty or has no header."))
+                    return
 
-            self.after(0, self.setup_display)
-            self.after(0, lambda: self.status_bar.config(text=f"Loaded {len(self.original_data):,} rows from {os.path.basename(self.file_path)}"))
+                # Read initial chunk
+                self.original_data = [row for _, row in zip(range(INITIAL_LOAD_ROWS), reader)]
+                self.csv_data = self.original_data[:]
+                
+                # Perform initial setup for immediate display
+                self._detect_column_types()
+                self._estimate_col_widths()
+                self.after(0, self.setup_display)
+                self.after(0, lambda: self.status_bar.config(text=f"Showing first {len(self.original_data):,} rows. Loading full file in background..."))
+
+                # Read the rest of the file in the background
+                for i, row in enumerate(reader, start=INITIAL_LOAD_ROWS):
+                    self.original_data.append(row)
+                    # Periodically update the UI to show progress
+                    if (i + 1) % UPDATE_INTERVAL_ROWS == 0:
+                        self.csv_data = self.original_data[:]
+                        self.after(0, self._update_display_post_load)
+
+                # Final update after the entire file is loaded
+                self.csv_data = self.original_data[:]
+                self.after(0, self._update_display_post_load)
+                self.after(0, self._finalize_load)
 
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Error", f"Failed to read file:\n{e}"))
             self.after(0, lambda: self.status_bar.config(text="Error loading file."))
+
+    def _update_display_post_load(self):
+        """Updates scroll region and redraws canvas during/after background load."""
+        self.total_rows = len(self.csv_data)
+        total_width = sum(self.col_widths.values())
+        total_height = self.total_rows * self.row_height
+        self.canvas.configure(scrollregion=(0, 0, total_width, total_height))
+        self.header_canvas.configure(scrollregion=(0, 0, total_width, self.header_canvas.winfo_height()))
+        self.redraw_canvas()
+        self.status_bar.config(text=f"Loaded {self.total_rows:,} rows...")
+    
+    def _finalize_load(self):
+        """Called on the main thread after the entire file is loaded."""
+        self.full_load_complete = True
+        self.edit_menu.entryconfig("Find/Filter...", state="normal")
+        self.status_bar.config(text=f"Loaded {len(self.original_data):,} rows from {os.path.basename(self.file_path)}")
+        print("File load complete.")
+
 
     def _estimate_col_widths(self):
         """Estimate column widths based on header and first few rows."""
@@ -431,6 +478,10 @@ class CSVViewer(tk.Tk):
             self.sort_info['col_index'] = col_index
             self.sort_info['ascending'] = True
 
+        if not self.full_load_complete:
+            self.status_bar.config(text="Please wait for the file to finish loading before sorting.")
+            return
+
         self.status_bar.config(text=f"Sorting by column '{self.column_names[col_index]}'...")
         
         thread = threading.Thread(target=self._perform_sort, daemon=True)
@@ -469,6 +520,10 @@ class CSVViewer(tk.Tk):
 
     def find_data(self):
         """Filters the data based on user input."""
+        if not self.full_load_complete:
+             self.status_bar.config(text="Please wait for the file to finish loading before filtering.")
+             return
+
         if not self.original_data:
             return
         
@@ -591,5 +646,4 @@ if __name__ == "__main__":
         app.after(100, lambda: app.load_file_from_path(file_to_open))
 
     app.mainloop()
-
 
