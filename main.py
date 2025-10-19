@@ -86,25 +86,22 @@ class CSVViewer(tk.Tk):
         """Creates the main widgets, replacing Treeview with a Canvas."""
         # Main frame
         main_frame = tk.Frame(self)
-        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
         main_frame.rowconfigure(1, weight=1)
         main_frame.columnconfigure(0, weight=1)
 
         # Header canvas (for horizontal scrolling headers)
-        self.header_canvas = tk.Canvas(main_frame, height=30, bd=0, highlightthickness=0)
+        self.header_canvas = tk.Canvas(main_frame, height=25, bd=0, highlightthickness=0)
         self.header_canvas.grid(row=0, column=0, sticky="ew")
-
-        # This frame will hold the actual header buttons
-        self.header_content_frame = tk.Frame(self.header_canvas)
-        self.header_canvas.create_window((0, 0), window=self.header_content_frame, anchor="nw")
+        self.header_canvas.bind("<Button-1>", self._on_header_click)
         
         # Canvas for CSV data
         self.canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
 
-        # Scrollbars
-        vsb = tk.Scrollbar(main_frame, orient="vertical", command=self.on_vscroll)
-        hsb = tk.Scrollbar(main_frame, orient="horizontal", command=self.on_hscroll)
+        # Scrollbars - using ttk for a flatter, theme-aware appearance
+        vsb = ttk.Scrollbar(main_frame, orient="vertical", command=self.on_vscroll)
+        hsb = ttk.Scrollbar(main_frame, orient="horizontal", command=self.on_hscroll)
         self.canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
         vsb.grid(row=1, column=1, sticky="ns")
@@ -132,15 +129,13 @@ class CSVViewer(tk.Tk):
         self.canvas.xview(*args)
         self.header_canvas.xview(*args)
         self.redraw_canvas()
+        self._redraw_header()
 
     def _on_mousewheel(self, event):
         """
         Handle mouse wheel scrolling in a cross-platform way.
         Normalizes the delta to provide consistent scroll speed.
         """
-        # A more robust way to handle cross-platform mouse wheel scrolling
-        # It checks for event.num on Linux and event.delta on Windows/macOS
-        # and only uses the direction, not the magnitude, to scroll.
         if event.num == 5 or event.delta < 0:
             # Scroll down
             self.canvas.yview_scroll(3, "units")
@@ -270,37 +265,36 @@ class CSVViewer(tk.Tk):
 
     def setup_display(self):
         """Set up the header and canvas scroll region."""
-        # Clear previous header widgets and column configurations
-        for widget in self.header_content_frame.winfo_children():
-            widget.destroy()
-        for i in range(len(self.header_content_frame.grid_slaves())):
-             self.header_content_frame.grid_columnconfigure(i, minsize=0)
-
-
-        for i, col_name in enumerate(self.column_names):
-            text = col_name
-            if self.sort_info['col_index'] == i:
-                text += ' ▲' if self.sort_info['ascending'] else ' ▼'
-            
-            col_width = self.col_widths.get(i, 100)
-            btn = tk.Button(
-                self.header_content_frame, text=text, relief=tk.FLAT,
-                font=self.header_font,
-                command=lambda c=i: self.sort_by_column(c)
-            )
-            btn.grid(row=0, column=i, sticky="nsew")
-            self.header_content_frame.grid_columnconfigure(i, minsize=col_width)
-        
-        # Update the header canvas scroll region after the buttons are created
-        self.header_content_frame.update_idletasks()
-        self.header_canvas.config(scrollregion=self.header_canvas.bbox("all"))
+        self._redraw_header()
 
         self.total_rows = len(self.csv_data)
         total_width = sum(self.col_widths.values())
         total_height = self.total_rows * self.row_height
         self.canvas.configure(scrollregion=(0, 0, total_width, total_height))
+        self.header_canvas.configure(scrollregion=(0, 0, total_width, self.header_canvas.winfo_height()))
         self.redraw_canvas()
 
+    def _redraw_header(self):
+        """Draws the column headers directly on the header canvas."""
+        self.header_canvas.delete("all")
+        x_left = self.header_canvas.xview()[0]
+        scroll_width = sum(self.col_widths.values())
+        x_offset = -int(x_left * scroll_width)
+
+        current_x = 0
+        for i, col_name in enumerate(self.column_names):
+            col_width = self.col_widths.get(i, 100)
+            
+            # Draw header text
+            text = col_name
+            if self.sort_info['col_index'] == i:
+                text += ' ▲' if self.sort_info['ascending'] else ' ▼'
+            
+            self.header_canvas.create_text(
+                current_x + x_offset + 10, self.header_canvas.winfo_height()/2,
+                text=text, anchor='w', font=self.header_font,
+            )
+            current_x += col_width
 
     def redraw_canvas(self, event=None):
         """Redraws the visible part of the canvas."""
@@ -481,6 +475,22 @@ class CSVViewer(tk.Tk):
                 self.status_bar.config(text=f"Copied '{value}' to clipboard.")
             except IndexError:
                 self.status_bar.config(text="Cannot copy cell, data out of sync.")
+
+    def _on_header_click(self, event):
+        """Handles clicks on the header canvas to trigger sorting."""
+        canvas_x = self.header_canvas.canvasx(event.x)
+        
+        current_x = 0
+        col = None
+        for i in range(len(self.column_names)):
+            col_width = self.col_widths.get(i, 100)
+            if current_x <= canvas_x < current_x + col_width:
+                col = i
+                break
+            current_x += col_width
+        
+        if col is not None:
+            self.sort_by_column(col)
 
     def _on_cell_click(self, event):
         """Handles clicks on the canvas to select a cell."""
