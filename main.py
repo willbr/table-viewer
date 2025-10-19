@@ -1,0 +1,435 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import csv
+import threading
+import sys
+import os
+
+class CSVViewer(tk.Tk):
+    """
+    A fast and simple CSV viewer application built with Tkinter.
+    It uses a virtualized canvas to efficiently display large CSV files,
+    and includes features like sorting, filtering, and go-to-line.
+    """
+    def __init__(self):
+        super().__init__()
+        self.title("Fast CSV Viewer")
+        self.geometry("800x600")
+
+        self.file_path = None
+        self.original_data = [] # Always holds the original, unfiltered data
+        self.csv_data = []      # Holds the data to be displayed (can be sorted/filtered)
+        self.column_names = []
+        self.sort_info = {'col_index': None, 'ascending': True}
+        self.col_alignments = {}
+        self.col_types = {}
+
+        # Virtual grid settings
+        self.row_height = 20
+        self.col_widths = {}
+        self.total_rows = 0
+        self.total_cols = 0
+
+        self._create_menu()
+        self._create_widgets()
+
+    def _create_menu(self):
+        """Creates the menu bar for the application."""
+        menu_bar = tk.Menu(self)
+        self.config(menu=menu_bar)
+
+        file_menu = tk.Menu(menu_bar, tearoff=0)
+        file_menu.add_command(label="Open...", command=self.open_file, accelerator="Ctrl+O")
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.quit)
+        menu_bar.add_cascade(label="File", menu=file_menu)
+        
+        edit_menu = tk.Menu(menu_bar, tearoff=0)
+        edit_menu.add_command(label="Find/Filter...", command=self.find_data, accelerator="Ctrl+F")
+        edit_menu.add_command(label="Clear Filter", command=self.clear_filter)
+        edit_menu.add_command(label="Go to Line...", command=self.go_to_line, accelerator="Ctrl+G")
+        menu_bar.add_cascade(label="Edit", menu=edit_menu)
+
+        help_menu = tk.Menu(menu_bar, tearoff=0)
+        help_menu.add_command(label="About", command=self.show_about)
+        menu_bar.add_cascade(label="Help", menu=help_menu)
+        
+        # Bind shortcuts
+        self.bind("<Control-o>", lambda event: self.open_file())
+        self.bind("<Control-f>", lambda event: self.find_data())
+        self.bind("<Control-g>", lambda event: self.go_to_line())
+
+    def _create_widgets(self):
+        """Creates the main widgets, replacing Treeview with a Canvas."""
+        # Main frame
+        main_frame = tk.Frame(self)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        main_frame.rowconfigure(1, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+
+        # Header canvas (for horizontal scrolling headers)
+        self.header_canvas = tk.Canvas(main_frame, height=30, bd=0, highlightthickness=0)
+        self.header_canvas.grid(row=0, column=0, sticky="ew")
+
+        # This frame will hold the actual header buttons
+        self.header_content_frame = tk.Frame(self.header_canvas)
+        self.header_canvas.create_window((0, 0), window=self.header_content_frame, anchor="nw")
+        
+        # Canvas for CSV data
+        self.canvas = tk.Canvas(main_frame, bg="white")
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+
+        # Scrollbars
+        vsb = tk.Scrollbar(main_frame, orient="vertical", command=self.on_vscroll)
+        hsb = tk.Scrollbar(main_frame, orient="horizontal", command=self.on_hscroll)
+        self.canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        vsb.grid(row=1, column=1, sticky="ns")
+        hsb.grid(row=2, column=0, sticky="ew")
+
+        # Status Bar
+        self.status_bar = tk.Label(self, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Bind events
+        self.canvas.bind("<Configure>", self.redraw_canvas)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def on_vscroll(self, *args):
+        """Handle vertical scrolling and redraw."""
+        self.canvas.yview(*args)
+        self.redraw_canvas()
+
+    def on_hscroll(self, *args):
+        """Handle horizontal scrolling for both canvas and header."""
+        self.canvas.xview(*args)
+        self.header_canvas.xview(*args)
+        self.redraw_canvas()
+
+    def _on_mousewheel(self, event):
+        """
+        Handle mouse wheel scrolling in a cross-platform way.
+        Normalizes the delta to provide consistent scroll speed.
+        """
+        # A more robust way to handle cross-platform mouse wheel scrolling
+        # It checks for event.num on Linux and event.delta on Windows/macOS
+        # and only uses the direction, not the magnitude, to scroll.
+        if event.num == 5 or event.delta < 0:
+            # Scroll down
+            self.canvas.yview_scroll(3, "units")
+        elif event.num == 4 or event.delta > 0:
+            # Scroll up
+            self.canvas.yview_scroll(-3, "units")
+        
+        self.redraw_canvas()
+
+    def open_file(self):
+        """Opens a file dialog to select a CSV file."""
+        file_path = filedialog.askopenfilename(
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.load_file_from_path(file_path)
+
+    def load_file_from_path(self, file_path):
+        """Initiates loading a file from a given path."""
+        if not os.path.exists(file_path):
+            messagebox.showerror("Error", f"File not found:\n{file_path}")
+            return
+
+        self.file_path = file_path
+        self.title(f"Fast CSV Viewer - {os.path.basename(self.file_path)}")
+        self.status_bar.config(text=f"Loading {self.file_path}...")
+        self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
+
+        # Use a thread to load the file to prevent the UI from freezing
+        thread = threading.Thread(target=self._load_csv_data, daemon=True)
+        thread.start()
+
+    def _load_csv_data(self):
+        """Loads data from the CSV file in a separate thread."""
+        try:
+            with open(self.file_path, 'r', encoding='utf-8', errors='replace') as f:
+                reader = csv.reader(f)
+                self.column_names = next(reader, None)
+                if self.column_names:
+                    self.original_data = list(reader)
+                    self.csv_data = self.original_data[:]
+                    self._detect_column_types()
+                    self._estimate_col_widths()
+
+            self.after(0, self.setup_display)
+            self.after(0, lambda: self.status_bar.config(text=f"Loaded {len(self.original_data):,} rows from {os.path.basename(self.file_path)}"))
+
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Error", f"Failed to read file:\n{e}"))
+            self.after(0, lambda: self.status_bar.config(text="Error loading file."))
+
+    def _estimate_col_widths(self):
+        """Estimate column widths based on header and first few rows."""
+        self.col_widths = {}
+        row_count = len(self.csv_data)
+        for i, col_name in enumerate(self.column_names):
+            header_width = len(col_name) * 8 + 25 # Estimate width + sort indicator
+            
+            max_data_width = 0
+            for row_idx in range(min(100, row_count)):
+                if i < len(self.csv_data[row_idx]):
+                    cell_width = len(self.csv_data[row_idx][i]) * 7 + 10
+                    if cell_width > max_data_width:
+                        max_data_width = cell_width
+            
+            self.col_widths[i] = max(header_width, max_data_width, 50)
+
+    def _detect_column_types(self):
+        """
+        Analyzes the first 100 rows to determine column types (text, int, float)
+        and sets their alignment accordingly.
+        """
+        self.col_alignments = {}
+        self.col_types = {}
+        if not self.csv_data:
+            return
+
+        num_rows_to_check = min(100, len(self.csv_data))
+        if num_rows_to_check == 0:
+            for i in range(len(self.column_names)):
+                self.col_alignments[i] = 'w'
+                self.col_types[i] = 'text'
+            return
+
+        for col_idx in range(len(self.column_names)):
+            col_type = 'int'  # Assume integer initially
+            for row_idx in range(num_rows_to_check):
+                try:
+                    cell_value = self.csv_data[row_idx][col_idx].strip()
+                    if cell_value:
+                        # If it has a decimal, it must be a float
+                        if '.' in cell_value:
+                            float(cell_value.replace(',', ''))
+                            col_type = 'float'
+                        # If it's already a float, keep checking as float
+                        elif col_type == 'float':
+                            float(cell_value.replace(',', ''))
+                        # Otherwise, check if it's an int
+                        else:
+                            int(cell_value.replace(',', ''))
+                except (ValueError, IndexError):
+                    col_type = 'text'  # If any value fails, it's a text column
+                    break
+            
+            self.col_types[col_idx] = col_type
+            if col_type in ['int', 'float']:
+                self.col_alignments[col_idx] = 'e'
+            else:
+                self.col_alignments[col_idx] = 'w'
+
+    def setup_display(self):
+        """Set up the header and canvas scroll region."""
+        # Clear previous header widgets and column configurations
+        for widget in self.header_content_frame.winfo_children():
+            widget.destroy()
+        for i in range(len(self.header_content_frame.grid_slaves())):
+             self.header_content_frame.grid_columnconfigure(i, minsize=0)
+
+
+        for i, col_name in enumerate(self.column_names):
+            text = col_name
+            if self.sort_info['col_index'] == i:
+                text += ' ▲' if self.sort_info['ascending'] else ' ▼'
+            
+            col_width = self.col_widths.get(i, 100)
+            btn = tk.Button(
+                self.header_content_frame, text=text, relief=tk.RAISED,
+                font=("TkDefaultFont", 10, "bold"),
+                command=lambda c=i: self.sort_by_column(c)
+            )
+            btn.grid(row=0, column=i, sticky="nsew")
+            self.header_content_frame.grid_columnconfigure(i, minsize=col_width)
+        
+        # Update the header canvas scroll region after the buttons are created
+        self.header_content_frame.update_idletasks()
+        self.header_canvas.config(scrollregion=self.header_canvas.bbox("all"))
+
+        self.total_rows = len(self.csv_data)
+        total_width = sum(self.col_widths.values())
+        total_height = self.total_rows * self.row_height
+        self.canvas.configure(scrollregion=(0, 0, total_width, total_height))
+        self.redraw_canvas()
+
+
+    def redraw_canvas(self, event=None):
+        """Redraws the visible part of the canvas."""
+        self.canvas.delete("all")
+        
+        if not self.csv_data:
+            return
+
+        y_top = self.canvas.yview()[0]
+        y_bottom = self.canvas.yview()[1]
+        x_left = self.canvas.xview()[0]
+
+        start_row = int(y_top * self.total_rows)
+        end_row = int(y_bottom * self.total_rows) + 2
+
+        scrollregion_str = self.canvas.cget("scrollregion")
+        if not scrollregion_str: return
+        scroll_width = int(scrollregion_str.split(' ')[2])
+        x_offset = -int(x_left * scroll_width)
+
+        for row_idx in range(start_row, min(end_row, self.total_rows)):
+            y = row_idx * self.row_height
+            
+            fill_color = "#f0f0f0" if row_idx % 2 == 0 else "white"
+            self.canvas.create_rectangle(0, y, scroll_width, y + self.row_height, fill=fill_color, outline="")
+
+            current_x = 0
+            row_data = self.csv_data[row_idx]
+
+            for col_idx, cell_value in enumerate(row_data):
+                col_width = self.col_widths.get(col_idx, 100)
+                
+                if (current_x + col_width + x_offset > 0) and (current_x + x_offset < self.canvas.winfo_width()):
+                    align = self.col_alignments.get(col_idx, 'w')
+                    col_type = self.col_types.get(col_idx, 'text')
+                    
+                    display_value = cell_value
+                    if col_type == 'float':
+                        try:
+                            # Format to 2 decimal places if possible
+                            display_value = f"{float(cell_value.replace(',', '')):.2f}"
+                        except (ValueError, TypeError):
+                            pass  # Keep original value if conversion fails
+
+                    padding = 5
+                    if align == 'e':
+                        anchor = 'e'
+                        text_x = current_x + x_offset + col_width - padding
+                    else:  # Default to 'w'
+                        anchor = 'w'
+                        text_x = current_x + x_offset + padding
+
+                    self.canvas.create_text(
+                        text_x,
+                        y + self.row_height / 2,
+                        anchor=anchor,
+                        text=display_value,
+                        fill="black",
+                        font=("TkDefaultFont", 9)
+                    )
+                current_x += col_width
+
+    def sort_by_column(self, col_index):
+        """Sorts the data by the selected column."""
+        if self.sort_info['col_index'] == col_index:
+            self.sort_info['ascending'] = not self.sort_info['ascending']
+        else:
+            self.sort_info['col_index'] = col_index
+            self.sort_info['ascending'] = True
+
+        self.status_bar.config(text=f"Sorting by column '{self.column_names[col_index]}'...")
+        
+        thread = threading.Thread(target=self._perform_sort, daemon=True)
+        thread.start()
+
+    def _perform_sort(self):
+        """The actual sorting logic, run in a background thread."""
+        col_index = self.sort_info['col_index']
+        ascending = self.sort_info['ascending']
+        
+        try:
+            # Attempt to convert to float for sorting, fallback to string
+            def sort_key(row):
+                try:
+                    return float(row[col_index])
+                except (ValueError, IndexError):
+                    try:
+                        return row[col_index]
+                    except IndexError:
+                        return "" # Handle ragged rows
+
+            self.csv_data.sort(key=sort_key, reverse=not ascending)
+            self.after(0, self.setup_display)
+            self.after(0, lambda: self.status_bar.config(text="Sort complete."))
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Sort Error", f"An error occurred while sorting:\n{e}"))
+
+    def find_data(self):
+        """Filters the data based on user input."""
+        if not self.original_data:
+            return
+        
+        search_term = simpledialog.askstring("Find/Filter", "Enter text to find:", parent=self)
+        if search_term:
+            self.status_bar.config(text=f"Filtering for '{search_term}'...")
+            thread = threading.Thread(
+                target=self._perform_filter, args=(search_term.lower(),), daemon=True
+            )
+            thread.start()
+
+    def _perform_filter(self, search_term):
+        """The actual filtering logic, run in a background thread."""
+        filtered_data = [
+            row for row in self.original_data 
+            if any(search_term in str(cell).lower() for cell in row)
+        ]
+        self.csv_data = filtered_data
+        
+        self.after(0, self.setup_display)
+        self.after(0, lambda: self.status_bar.config(text=f"Found {len(self.csv_data):,} matching rows."))
+
+
+    def clear_filter(self):
+        """Resets the view to show the original, unfiltered data."""
+        if not self.original_data:
+            return
+        self.csv_data = self.original_data[:]
+        self.status_bar.config(text="Filter cleared.")
+        self.setup_display()
+
+    def go_to_line(self):
+        """Jumps the view to a specific line number."""
+        if not self.csv_data:
+            return
+            
+        line_num = simpledialog.askinteger(
+            "Go to Line", 
+            f"Enter line number (1 - {self.total_rows}):",
+            parent=self, minvalue=1, maxvalue=self.total_rows
+        )
+        if line_num:
+            fraction = (line_num - 1) / self.total_rows if self.total_rows > 0 else 0
+            self.canvas.yview_moveto(fraction)
+            self.redraw_canvas()
+
+    def show_about(self):
+        """Shows the about dialog."""
+        messagebox.showinfo(
+            "About Fast CSV Viewer",
+            "A simple, fast CSV viewer for large files.\n\nBuilt with Python and Tkinter."
+        )
+
+
+if __name__ == "__main__":
+    app = CSVViewer()
+    style = ttk.Style(app)
+    try:
+        style.theme_use('clam')
+    except tk.TclError:
+        print("Clam theme not available, using default.")
+
+    # Check for command-line argument for a file to open
+    if len(sys.argv) > 1:
+        file_to_open = sys.argv[1]
+        # Schedule the file loading to occur shortly after the mainloop starts
+        # This allows the GUI to appear before the file loading begins.
+        app.after(100, lambda: app.load_file_from_path(file_to_open))
+
+    app.mainloop()
+
+
+
+
+
+
+
