@@ -36,8 +36,9 @@ class CSVViewer(tk.Tk):
         ]
 
         self.file_path = None
-        self.original_data = [] # Always holds the original, unfiltered data
-        self.csv_data = []      # Holds the data to be displayed (can be sorted/filtered)
+        self.original_data = [] # Always holds the original, unfiltered data as strings
+        self.parsed_data = []   # Holds (display_val, sort_key) tuples for fast sorting
+        self.csv_data = []      # The data currently being displayed (points to parsed_data or a filtered subset)
         self.column_names = []
         self.sort_info = {'col_index': None, 'ascending': True}
         self.col_alignments = {}
@@ -206,6 +207,7 @@ class CSVViewer(tk.Tk):
         self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
         self.selected_cell = {'row': None, 'col': None} # Reset selection
         self.full_load_complete = False
+        self.parsed_data = []
         self.edit_menu.entryconfig("Find/Filter...", state="disabled")
 
 
@@ -232,12 +234,12 @@ class CSVViewer(tk.Tk):
 
                 # Read initial chunk
                 self.original_data = [row for _, row in zip(range(INITIAL_LOAD_ROWS), reader)]
-                self.csv_data = self.original_data[:]
+                self.csv_data = self.original_data[:] # Initially, show the raw, unparsed data
                 
                 # Perform initial setup for immediate display
                 self._detect_column_types()
                 self._estimate_col_widths()
-                self.after(0, self.setup_display)
+                self.after(0, self.setup_display) # Display raw data immediately
                 self.after(0, lambda: self.status_bar.config(text=f"Showing first {len(self.original_data):,} rows. Loading full file in background..."))
 
                 # Read the rest of the file in the background
@@ -245,40 +247,86 @@ class CSVViewer(tk.Tk):
                     self.original_data.append(row)
                     # Periodically update the UI to show progress
                     if (i + 1) % UPDATE_INTERVAL_ROWS == 0:
-                        self.csv_data = self.original_data[:]
-                        self.after(0, self._update_display_post_load)
+                        self.after(0, self._update_row_count_display)
 
                 # Final update after the entire file is loaded
-                self.csv_data = self.original_data[:]
-                self.after(0, self._update_display_post_load)
                 self.after(0, self._finalize_load)
 
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Error", f"Failed to read file:\n{e}"))
             self.after(0, lambda: self.status_bar.config(text="Error loading file."))
 
-    def _update_display_post_load(self):
-        """Updates scroll region and redraws canvas during/after background load."""
-        self.total_rows = len(self.csv_data)
+    def _parse_and_display_initial_chunk(self):
+        """DEPRECATED - This logic is now handled directly in _load_csv_data for speed."""
+        # We only parse the initial chunk here. The full parse happens after load.
+        self.parsed_data = self._parse_chunk(self.original_data)
+        self.csv_data = self.parsed_data[:]
+        self.setup_display()
+        
+    def _update_row_count_display(self):
+        """Updates scroll region based on currently loaded original_data count."""
+        self.total_rows = len(self.original_data)
         total_width = sum(self.col_widths.values())
         total_height = self.total_rows * self.row_height
         self.canvas.configure(scrollregion=(0, 0, total_width, total_height))
-        self.header_canvas.configure(scrollregion=(0, 0, total_width, self.header_canvas.winfo_height()))
-        self.redraw_canvas()
         self.status_bar.config(text=f"Loaded {self.total_rows:,} rows...")
     
     def _finalize_load(self):
         """Called on the main thread after the entire file is loaded."""
+        print("File load complete. Now parsing data...")
+        self.status_bar.config(text=f"Loaded {len(self.original_data):,} rows. Parsing data for sorting...")
+        thread = threading.Thread(target=self._parse_full_dataset, daemon=True)
+        thread.start()
+
+    def _parse_full_dataset(self):
+        """
+        Parses the entire loaded dataset to create sort keys.
+        This is a one-time operation to make subsequent sorting much faster.
+        """
+        self.parsed_data = self._parse_chunk(self.original_data)
+        self.csv_data = self.parsed_data[:]
+        self.after(0, self._finalize_parsing)
+    
+    def _parse_chunk(self, data_chunk):
+        """Parses a list of rows into the (display_val, sort_key) format."""
+        parsed_chunk = []
+        for row in data_chunk:
+            parsed_row = []
+            for col_idx, cell in enumerate(row):
+                col_type = self.col_types.get(col_idx, 'text')
+                sort_key_val = self._get_sort_key_for_cell(cell, col_type)
+                parsed_row.append((cell, sort_key_val))
+            parsed_chunk.append(parsed_row)
+        return parsed_chunk
+
+    def _get_sort_key_for_cell(self, val, col_type):
+        """Helper to generate a sortable key from a cell value and type."""
+        if not val:
+            return datetime.min if col_type == 'datetime' else ""
+        try:
+            if col_type == 'int': return int(val.replace(',', ''))
+            if col_type == 'float': return float(val.replace(',', ''))
+            if col_type == 'datetime':
+                for fmt in self.DATETIME_FORMATS:
+                    try: return datetime.strptime(val, fmt)
+                    except (ValueError, TypeError): pass
+                return datetime.min # Fallback
+            return val.lower()
+        except (ValueError, IndexError):
+            return ""
+
+    def _finalize_parsing(self):
+        """Called on the main thread after parsing is complete."""
         self.full_load_complete = True
         self.edit_menu.entryconfig("Find/Filter...", state="normal")
-        self.status_bar.config(text=f"Loaded {len(self.original_data):,} rows from {os.path.basename(self.file_path)}")
-        print("File load complete.")
-
+        self.status_bar.config(text=f"Ready. {len(self.original_data):,} rows from {os.path.basename(self.file_path)}")
+        self.setup_display() # Redraw with the final data
+        print("Data parsing complete. Sorting is now enabled.")
 
     def _estimate_col_widths(self):
         """Estimate column widths based on header and first few rows."""
         self.col_widths = {}
-        row_count = len(self.csv_data)
+        row_count = len(self.original_data) # Use original_data for estimation
         for i, col_name in enumerate(self.column_names):
             header_width = self.header_font.measure(col_name) + 30 # Padding for sort indicator
             
@@ -287,8 +335,8 @@ class CSVViewer(tk.Tk):
             font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
             
             for row_idx in range(min(100, row_count)):
-                if i < len(self.csv_data[row_idx]):
-                    cell_width = font_to_use.measure(self.csv_data[row_idx][i]) + 15 # Padding
+                if i < len(self.original_data[row_idx]):
+                    cell_width = font_to_use.measure(self.original_data[row_idx][i]) + 15 # Padding
                     if cell_width > max_data_width:
                         max_data_width = cell_width
             
@@ -301,10 +349,10 @@ class CSVViewer(tk.Tk):
         """
         self.col_alignments = {}
         self.col_types = {}
-        if not self.csv_data:
+        if not self.original_data:
             return
 
-        num_rows_to_check = min(100, len(self.csv_data))
+        num_rows_to_check = min(100, len(self.original_data))
         if num_rows_to_check == 0:
             for i in range(len(self.column_names)):
                 self.col_alignments[i] = 'w'
@@ -316,7 +364,7 @@ class CSVViewer(tk.Tk):
             is_int, is_float, is_datetime = True, True, True
             for row_idx in range(num_rows_to_check):
                 try:
-                    cell_value = self.csv_data[row_idx][col_idx].strip()
+                    cell_value = self.original_data[row_idx][col_idx].strip()
                     if cell_value:
                         if is_int:
                             try: int(cell_value.replace(',', ''))
@@ -353,8 +401,9 @@ class CSVViewer(tk.Tk):
     def setup_display(self):
         """Set up the header and canvas scroll region."""
         self._redraw_header()
-
-        self.total_rows = len(self.csv_data)
+        
+        # Use full dataset size for scroll region if available, otherwise use partial
+        self.total_rows = len(self.original_data)
         total_width = sum(self.col_widths.values())
         total_height = self.total_rows * self.row_height
         self.canvas.configure(scrollregion=(0, 0, total_width, total_height))
@@ -406,16 +455,20 @@ class CSVViewer(tk.Tk):
         y_top = self.canvas.yview()[0]
         y_bottom = self.canvas.yview()[1]
         x_left = self.canvas.xview()[0]
+        
+        # Total rows for y-view calculation should be based on full dataset size
+        total_rows_for_view = len(self.original_data) if self.full_load_complete else self.total_rows
+        if total_rows_for_view == 0: return
 
-        start_row = int(y_top * self.total_rows)
-        end_row = int(y_bottom * self.total_rows) + 2
+        start_row = int(y_top * total_rows_for_view)
+        end_row = int(y_bottom * total_rows_for_view) + 2
 
         scrollregion_str = self.canvas.cget("scrollregion")
         if not scrollregion_str: return
         scroll_width = int(scrollregion_str.split(' ')[2])
         x_offset = -int(x_left * scroll_width)
 
-        for row_idx in range(start_row, min(end_row, self.total_rows)):
+        for row_idx in range(start_row, min(end_row, len(self.csv_data))):
             y = row_idx * self.row_height
             
             # Draw a thin grid line instead of alternating row colors
@@ -436,7 +489,9 @@ class CSVViewer(tk.Tk):
                     outline=""
                 )
 
-            for col_idx, cell_value in enumerate(row_data):
+            for col_idx, cell_data in enumerate(row_data):
+                # Handle both parsed (tuple) and unparsed (string) data formats
+                cell_value = cell_data[0] if isinstance(cell_data, tuple) else cell_data
                 col_width = self.col_widths.get(col_idx, 100)
                 
                 if (current_x + col_width + x_offset > 0) and (current_x + x_offset < self.canvas.winfo_width()):
@@ -491,28 +546,10 @@ class CSVViewer(tk.Tk):
         """The actual sorting logic, run in a background thread."""
         col_index = self.sort_info['col_index']
         ascending = self.sort_info['ascending']
-        col_type = self.col_types.get(col_index, 'text')
         
         try:
-            # Create a more intelligent sort key based on detected column type
-            def sort_key(row):
-                try:
-                    val = row[col_index]
-                    if not val: return datetime.min if col_type == 'datetime' else ""
-
-                    if col_type == 'int': return int(val.replace(',', ''))
-                    if col_type == 'float': return float(val.replace(',', ''))
-                    if col_type == 'datetime':
-                        for fmt in self.DATETIME_FORMATS:
-                            try: return datetime.strptime(val, fmt)
-                            except (ValueError, TypeError): pass
-                        return datetime.min # Fallback for un-parsable dates
-                    
-                    return val.lower() # Case-insensitive text sort
-                except (ValueError, IndexError):
-                    return "" # Handle conversion errors or ragged rows
-
-            self.csv_data.sort(key=sort_key, reverse=not ascending)
+            # Sort using the pre-parsed sort key (the second element of the tuple)
+            self.csv_data.sort(key=lambda row: row[col_index][1], reverse=not ascending)
             self.after(0, self.setup_display)
             self.after(0, lambda: self.status_bar.config(text="Sort complete."))
         except Exception as e:
@@ -537,11 +574,14 @@ class CSVViewer(tk.Tk):
 
     def _perform_filter(self, search_term):
         """The actual filtering logic, run in a background thread."""
-        filtered_data = [
-            row for row in self.original_data 
+        # Filter on the original string data to get indices
+        matching_indices = [
+            i for i, row in enumerate(self.original_data)
             if any(search_term in str(cell).lower() for cell in row)
         ]
-        self.csv_data = filtered_data
+        # Build the filtered view from the parsed data using the indices
+        self.csv_data = [self.parsed_data[i] for i in matching_indices]
+        
         self.selected_cell = {'row': None, 'col': None} # Reset selection
         self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
         
@@ -553,7 +593,8 @@ class CSVViewer(tk.Tk):
         """Resets the view to show the original, unfiltered data."""
         if not self.original_data:
             return
-        self.csv_data = self.original_data[:]
+        # Point the view back to the full parsed dataset
+        self.csv_data = self.parsed_data[:]
         self.selected_cell = {'row': None, 'col': None} # Reset selection
         self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
         self.status_bar.config(text="Filter cleared.")
@@ -566,11 +607,12 @@ class CSVViewer(tk.Tk):
             
         line_num = simpledialog.askinteger(
             "Go to Line", 
-            f"Enter line number (1 - {self.total_rows}):",
-            parent=self, minvalue=1, maxvalue=self.total_rows
+            f"Enter line number (1 - {len(self.original_data)}):",
+            parent=self, minvalue=1, maxvalue=len(self.original_data)
         )
         if line_num:
-            fraction = (line_num - 1) / self.total_rows if self.total_rows > 0 else 0
+            total_rows_for_view = len(self.original_data)
+            fraction = (line_num - 1) / total_rows_for_view if total_rows_for_view > 0 else 0
             self.canvas.yview_moveto(fraction)
             self.redraw_canvas()
 
@@ -579,7 +621,9 @@ class CSVViewer(tk.Tk):
         sel = self.selected_cell
         if sel['row'] is not None and sel['col'] is not None:
             try:
-                value = self.csv_data[sel['row']][sel['col']]
+                cell_data = self.csv_data[sel['row']][sel['col']]
+                # Handle both parsed (tuple) and unparsed (string) data formats
+                value = cell_data[0] if isinstance(cell_data, tuple) else cell_data
                 self.clipboard_clear()
                 self.clipboard_append(value)
                 self.status_bar.config(text=f"Copied '{value}' to clipboard.")
@@ -646,4 +690,5 @@ if __name__ == "__main__":
         app.after(100, lambda: app.load_file_from_path(file_to_open))
 
     app.mainloop()
+
 
