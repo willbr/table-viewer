@@ -4,6 +4,7 @@ import csv
 import threading
 import sys
 import os
+import subprocess
 from datetime import datetime
 
 class CSVViewer(tk.Tk):
@@ -19,10 +20,9 @@ class CSVViewer(tk.Tk):
 
         self.modifier = "Command" if sys.platform == "darwin" else "Control"
 
-        # --- Tufte-inspired UI Colors ---
-        self.GRID_LINE_COLOR = "#e0e0e0"
-        self.SELECTION_COLOR = "#e8e8e8"
-        
+        # --- Setup Theme and Colors ---
+        self._setup_theme_colors()
+
         # Fonts
         self.default_font = tkFont.Font(family="Helvetica", size=9)
         self.mono_font = tkFont.Font(family="Courier New", size=9)
@@ -50,8 +50,47 @@ class CSVViewer(tk.Tk):
         self.total_rows = 0
         self.total_cols = 0
 
+        self.config(bg=self.BACKGROUND_COLOR) # Set root window background
         self._create_menu()
         self._create_widgets()
+
+    def _setup_theme_colors(self):
+        """Sets up theme-aware colors, with a special check for macOS dark mode."""
+        style = ttk.Style(self)
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            print("Clam theme not available, using default.")
+
+        # --- Theme-aware UI Colors ---
+        is_dark_mode = False
+        if sys.platform == "darwin":
+            try:
+                # Use subprocess to query macOS for its interface style for robustness
+                cmd = 'defaults read -g AppleInterfaceStyle'
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, shell=True)
+                output, _ = p.communicate()
+                # The command returns 'Dark' if in dark mode
+                if output.strip().decode() == 'Dark':
+                    is_dark_mode = True
+            except Exception as e:
+                # Fallback if the command fails
+                print(f"Could not detect dark mode on macOS: {e}")
+                pass
+
+        if is_dark_mode:
+            # Manually define colors for a consistent dark theme
+            self.BACKGROUND_COLOR = "#2e2e2e"
+            self.FOREGROUND_COLOR = "#dcdcdc"
+            self.SELECTION_COLOR = "#5a5a5a"
+            self.GRID_LINE_COLOR = "#4a4a4a"
+        else:
+            # Use theme-provided colors for light mode or other OSes
+            self.BACKGROUND_COLOR = style.lookup('TFrame', 'background')
+            self.FOREGROUND_COLOR = style.lookup('TLabel', 'foreground')
+            self.SELECTION_COLOR = style.lookup('TEntry', 'selectbackground')
+            self.GRID_LINE_COLOR = style.lookup('TLabel', 'foreground', ('disabled',))
 
     def _create_menu(self):
         """Creates the menu bar for the application."""
@@ -86,18 +125,18 @@ class CSVViewer(tk.Tk):
     def _create_widgets(self):
         """Creates the main widgets, replacing Treeview with a Canvas."""
         # Main frame
-        main_frame = tk.Frame(self)
+        main_frame = tk.Frame(self, bg=self.BACKGROUND_COLOR)
         main_frame.pack(fill="both", expand=True, padx=5, pady=5)
         main_frame.rowconfigure(1, weight=1)
         main_frame.columnconfigure(0, weight=1)
 
         # Header canvas (for horizontal scrolling headers)
-        self.header_canvas = tk.Canvas(main_frame, height=25, bd=0, highlightthickness=0)
+        self.header_canvas = tk.Canvas(main_frame, height=25, bd=0, highlightthickness=0, bg=self.BACKGROUND_COLOR)
         self.header_canvas.grid(row=0, column=0, sticky="ew")
         self.header_canvas.bind("<Button-1>", self._on_header_click)
         
         # Canvas for CSV data
-        self.canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
+        self.canvas = tk.Canvas(main_frame, bg=self.BACKGROUND_COLOR, highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
 
         # Scrollbars - using ttk for a flatter, theme-aware appearance
@@ -111,8 +150,8 @@ class CSVViewer(tk.Tk):
         # Separator before status bar
         ttk.Separator(self, orient='horizontal').pack(side=tk.BOTTOM, fill='x', padx=5)
 
-        # Status Bar
-        self.status_bar = tk.Label(self, text="Ready", bd=0, relief=tk.FLAT, anchor=tk.W, padx=5)
+        # Status Bar - use ttk.Label for better theme integration
+        self.status_bar = ttk.Label(self, text="Ready", anchor=tk.W, padding=(5, 2))
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Bind events
@@ -294,6 +333,7 @@ class CSVViewer(tk.Tk):
             self.header_canvas.create_text(
                 current_x + x_offset + 10, self.header_canvas.winfo_height()/2,
                 text=text, anchor='w', font=self.header_font,
+                fill=self.FOREGROUND_COLOR
             )
             current_x += col_width
 
@@ -366,7 +406,7 @@ class CSVViewer(tk.Tk):
                         y + self.row_height / 2,
                         anchor=anchor,
                         text=display_value,
-                        fill="black",
+                        fill=self.FOREGROUND_COLOR,
                         font=font_to_use
                     )
                 current_x += col_width
@@ -530,11 +570,6 @@ class CSVViewer(tk.Tk):
 
 if __name__ == "__main__":
     app = CSVViewer()
-    style = ttk.Style(app)
-    try:
-        style.theme_use('clam')
-    except tk.TclError:
-        print("Clam theme not available, using default.")
 
     # Check for command-line argument for a file to open
     if len(sys.argv) > 1:
@@ -544,6 +579,4 @@ if __name__ == "__main__":
         app.after(100, lambda: app.load_file_from_path(file_to_open))
 
     app.mainloop()
-
-
 
