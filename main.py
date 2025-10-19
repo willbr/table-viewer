@@ -19,6 +19,10 @@ class CSVViewer(tk.Tk):
 
         self.modifier = "Command" if sys.platform == "darwin" else "Control"
 
+        # --- Tufte-inspired UI Colors ---
+        self.GRID_LINE_COLOR = "#e0e0e0"
+        self.SELECTION_COLOR = "#e8e8e8"
+        
         # Fonts
         self.default_font = tkFont.Font(family="Helvetica", size=9)
         self.mono_font = tkFont.Font(family="Courier New", size=9)
@@ -95,7 +99,7 @@ class CSVViewer(tk.Tk):
         self.header_canvas.create_window((0, 0), window=self.header_content_frame, anchor="nw")
         
         # Canvas for CSV data
-        self.canvas = tk.Canvas(main_frame, bg="white")
+        self.canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
 
         # Scrollbars
@@ -105,9 +109,12 @@ class CSVViewer(tk.Tk):
 
         vsb.grid(row=1, column=1, sticky="ns")
         hsb.grid(row=2, column=0, sticky="ew")
+        
+        # Separator before status bar
+        ttk.Separator(self, orient='horizontal').pack(side=tk.BOTTOM, fill='x', padx=5)
 
         # Status Bar
-        self.status_bar = tk.Label(self, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar = tk.Label(self, text="Ready", bd=0, relief=tk.FLAT, anchor=tk.W, padx=5)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Bind events
@@ -277,7 +284,7 @@ class CSVViewer(tk.Tk):
             
             col_width = self.col_widths.get(i, 100)
             btn = tk.Button(
-                self.header_content_frame, text=text, relief=tk.RAISED,
+                self.header_content_frame, text=text, relief=tk.FLAT,
                 font=self.header_font,
                 command=lambda c=i: self.sort_by_column(c)
             )
@@ -317,13 +324,13 @@ class CSVViewer(tk.Tk):
         for row_idx in range(start_row, min(end_row, self.total_rows)):
             y = row_idx * self.row_height
             
-            fill_color = "#f0f0f0" if row_idx % 2 == 0 else "white"
-            self.canvas.create_rectangle(0, y, scroll_width, y + self.row_height, fill=fill_color, outline="")
+            # Draw a thin grid line instead of alternating row colors
+            self.canvas.create_line(0, y + self.row_height, scroll_width, y + self.row_height, fill=self.GRID_LINE_COLOR)
 
             current_x = 0
             row_data = self.csv_data[row_idx]
 
-            # Highlight selected cell
+            # Highlight selected cell with a subtle color
             if row_idx == self.selected_cell['row']:
                  col_to_highlight = self.selected_cell['col']
                  highlight_x = sum(self.col_widths.get(i, 100) for i in range(col_to_highlight))
@@ -331,8 +338,8 @@ class CSVViewer(tk.Tk):
                  self.canvas.create_rectangle(
                     highlight_x + x_offset, y,
                     highlight_x + highlight_width + x_offset, y + self.row_height,
-                    fill="#cce5ff", # A light blue color for selection
-                    outline="#0078d7"
+                    fill=self.SELECTION_COLOR,
+                    outline=""
                 )
 
             for col_idx, cell_value in enumerate(row_data):
