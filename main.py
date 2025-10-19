@@ -1,9 +1,10 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, font as tkFont
 import csv
 import threading
 import sys
 import os
+from datetime import datetime
 
 class CSVViewer(tk.Tk):
     """
@@ -17,6 +18,18 @@ class CSVViewer(tk.Tk):
         self.geometry("800x600")
 
         self.modifier = "Command" if sys.platform == "darwin" else "Control"
+
+        # Fonts
+        self.default_font = tkFont.Font(family="Helvetica", size=9)
+        self.mono_font = tkFont.Font(family="Courier New", size=9)
+        self.header_font = tkFont.Font(family="Helvetica", size=10, weight="bold")
+        
+        # Common date and datetime formats to check against
+        self.DATETIME_FORMATS = [
+            '%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S', '%Y-%m-%d %H:%M',
+            '%m/%d/%Y %I:%M %p', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d',
+            '%m/%d/%Y', '%m-%d-%Y', '%Y/%m/%d', '%d-%m-%Y', '%d/%m/%Y'
+        ]
 
         self.file_path = None
         self.original_data = [] # Always holds the original, unfiltered data
@@ -178,12 +191,15 @@ class CSVViewer(tk.Tk):
         self.col_widths = {}
         row_count = len(self.csv_data)
         for i, col_name in enumerate(self.column_names):
-            header_width = len(col_name) * 8 + 25 # Estimate width + sort indicator
+            header_width = self.header_font.measure(col_name) + 30 # Padding for sort indicator
             
             max_data_width = 0
+            col_type = self.col_types.get(i, 'text')
+            font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
+            
             for row_idx in range(min(100, row_count)):
                 if i < len(self.csv_data[row_idx]):
-                    cell_width = len(self.csv_data[row_idx][i]) * 7 + 10
+                    cell_width = font_to_use.measure(self.csv_data[row_idx][i]) + 15 # Padding
                     if cell_width > max_data_width:
                         max_data_width = cell_width
             
@@ -191,7 +207,7 @@ class CSVViewer(tk.Tk):
 
     def _detect_column_types(self):
         """
-        Analyzes the first 100 rows to determine column types (text, int, float)
+        Analyzes the first 100 rows to determine column types (text, int, float, datetime)
         and sets their alignment accordingly.
         """
         self.col_alignments = {}
@@ -207,30 +223,43 @@ class CSVViewer(tk.Tk):
             return
 
         for col_idx in range(len(self.column_names)):
-            col_type = 'int'  # Assume integer initially
+            # Determine the most likely type by checking all sample rows
+            is_int, is_float, is_datetime = True, True, True
             for row_idx in range(num_rows_to_check):
                 try:
                     cell_value = self.csv_data[row_idx][col_idx].strip()
                     if cell_value:
-                        # If it has a decimal, it must be a float
-                        if '.' in cell_value:
-                            float(cell_value.replace(',', ''))
-                            col_type = 'float'
-                        # If it's already a float, keep checking as float
-                        elif col_type == 'float':
-                            float(cell_value.replace(',', ''))
-                        # Otherwise, check if it's an int
-                        else:
-                            int(cell_value.replace(',', ''))
-                except (ValueError, IndexError):
-                    col_type = 'text'  # If any value fails, it's a text column
-                    break
+                        if is_int:
+                            try: int(cell_value.replace(',', ''))
+                            except ValueError: is_int = False
+                        if is_float:
+                            try: float(cell_value.replace(',', ''))
+                            except ValueError: is_float = False
+                        if is_datetime:
+                            if not self._is_datetime(cell_value): is_datetime = False
+                except IndexError:
+                    continue # Skip ragged rows
+
+            col_type = 'text'
+            if is_int: col_type = 'int'
+            elif is_float: col_type = 'float'
+            elif is_datetime: col_type = 'datetime'
             
             self.col_types[col_idx] = col_type
-            if col_type in ['int', 'float']:
+            if col_type in ['int', 'float', 'datetime']:
                 self.col_alignments[col_idx] = 'e'
             else:
                 self.col_alignments[col_idx] = 'w'
+
+    def _is_datetime(self, s):
+        """Helper to check if a string matches common date/datetime formats."""
+        for fmt in self.DATETIME_FORMATS:
+            try:
+                datetime.strptime(s, fmt)
+                return True
+            except (ValueError, TypeError):
+                pass
+        return False
 
     def setup_display(self):
         """Set up the header and canvas scroll region."""
@@ -249,7 +278,7 @@ class CSVViewer(tk.Tk):
             col_width = self.col_widths.get(i, 100)
             btn = tk.Button(
                 self.header_content_frame, text=text, relief=tk.RAISED,
-                font=("TkDefaultFont", 10, "bold"),
+                font=self.header_font,
                 command=lambda c=i: self.sort_by_column(c)
             )
             btn.grid(row=0, column=i, sticky="nsew")
@@ -312,6 +341,7 @@ class CSVViewer(tk.Tk):
                 if (current_x + col_width + x_offset > 0) and (current_x + x_offset < self.canvas.winfo_width()):
                     align = self.col_alignments.get(col_idx, 'w')
                     col_type = self.col_types.get(col_idx, 'text')
+                    font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
                     
                     display_value = cell_value
                     if col_type == 'float':
@@ -335,7 +365,7 @@ class CSVViewer(tk.Tk):
                         anchor=anchor,
                         text=display_value,
                         fill="black",
-                        font=("TkDefaultFont", 9)
+                        font=font_to_use
                     )
                 current_x += col_width
 
@@ -356,17 +386,26 @@ class CSVViewer(tk.Tk):
         """The actual sorting logic, run in a background thread."""
         col_index = self.sort_info['col_index']
         ascending = self.sort_info['ascending']
+        col_type = self.col_types.get(col_index, 'text')
         
         try:
-            # Attempt to convert to float for sorting, fallback to string
+            # Create a more intelligent sort key based on detected column type
             def sort_key(row):
                 try:
-                    return float(row[col_index])
+                    val = row[col_index]
+                    if not val: return datetime.min if col_type == 'datetime' else ""
+
+                    if col_type == 'int': return int(val.replace(',', ''))
+                    if col_type == 'float': return float(val.replace(',', ''))
+                    if col_type == 'datetime':
+                        for fmt in self.DATETIME_FORMATS:
+                            try: return datetime.strptime(val, fmt)
+                            except (ValueError, TypeError): pass
+                        return datetime.min # Fallback for un-parsable dates
+                    
+                    return val.lower() # Case-insensitive text sort
                 except (ValueError, IndexError):
-                    try:
-                        return row[col_index]
-                    except IndexError:
-                        return "" # Handle ragged rows
+                    return "" # Handle conversion errors or ragged rows
 
             self.csv_data.sort(key=sort_key, reverse=not ascending)
             self.after(0, self.setup_display)
@@ -485,12 +524,4 @@ if __name__ == "__main__":
         app.after(100, lambda: app.load_file_from_path(file_to_open))
 
     app.mainloop()
-
-
-
-
-
-
-
-
 
