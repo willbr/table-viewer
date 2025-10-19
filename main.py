@@ -16,6 +16,8 @@ class CSVViewer(tk.Tk):
         self.title("Fast CSV Viewer")
         self.geometry("800x600")
 
+        self.modifier = "Command" if sys.platform == "darwin" else "Control"
+
         self.file_path = None
         self.original_data = [] # Always holds the original, unfiltered data
         self.csv_data = []      # Holds the data to be displayed (can be sorted/filtered)
@@ -23,6 +25,7 @@ class CSVViewer(tk.Tk):
         self.sort_info = {'col_index': None, 'ascending': True}
         self.col_alignments = {}
         self.col_types = {}
+        self.selected_cell = {'row': None, 'col': None}
 
         # Virtual grid settings
         self.row_height = 20
@@ -39,15 +42,17 @@ class CSVViewer(tk.Tk):
         self.config(menu=menu_bar)
 
         file_menu = tk.Menu(menu_bar, tearoff=0)
-        file_menu.add_command(label="Open...", command=self.open_file, accelerator="Ctrl+O")
+        file_menu.add_command(label="Open...", command=self.open_file, accelerator=f"{self.modifier}+O")
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menu_bar.add_cascade(label="File", menu=file_menu)
         
         edit_menu = tk.Menu(menu_bar, tearoff=0)
-        edit_menu.add_command(label="Find/Filter...", command=self.find_data, accelerator="Ctrl+F")
+        edit_menu.add_command(label="Find/Filter...", command=self.find_data, accelerator=f"{self.modifier}+F")
         edit_menu.add_command(label="Clear Filter", command=self.clear_filter)
-        edit_menu.add_command(label="Go to Line...", command=self.go_to_line, accelerator="Ctrl+G")
+        edit_menu.add_command(label="Go to Line...", command=self.go_to_line, accelerator=f"{self.modifier}+G")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Copy", command=self.copy_selection, accelerator=f"{self.modifier}+C")
         menu_bar.add_cascade(label="Edit", menu=edit_menu)
 
         help_menu = tk.Menu(menu_bar, tearoff=0)
@@ -55,9 +60,10 @@ class CSVViewer(tk.Tk):
         menu_bar.add_cascade(label="Help", menu=help_menu)
         
         # Bind shortcuts
-        self.bind("<Control-o>", lambda event: self.open_file())
-        self.bind("<Control-f>", lambda event: self.find_data())
-        self.bind("<Control-g>", lambda event: self.go_to_line())
+        self.bind(f"<{self.modifier}-o>", lambda event: self.open_file())
+        self.bind(f"<{self.modifier}-f>", lambda event: self.find_data())
+        self.bind(f"<{self.modifier}-g>", lambda event: self.go_to_line())
+        self.bind(f"<{self.modifier}-c>", lambda event: self.copy_selection())
 
     def _create_widgets(self):
         """Creates the main widgets, replacing Treeview with a Canvas."""
@@ -94,6 +100,7 @@ class CSVViewer(tk.Tk):
         # Bind events
         self.canvas.bind("<Configure>", self.redraw_canvas)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-1>", self._on_cell_click)
 
     def on_vscroll(self, *args):
         """Handle vertical scrolling and redraw."""
@@ -141,6 +148,7 @@ class CSVViewer(tk.Tk):
         self.title(f"Fast CSV Viewer - {os.path.basename(self.file_path)}")
         self.status_bar.config(text=f"Loading {self.file_path}...")
         self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
+        self.selected_cell = {'row': None, 'col': None} # Reset selection
 
         # Use a thread to load the file to prevent the UI from freezing
         thread = threading.Thread(target=self._load_csv_data, daemon=True)
@@ -286,6 +294,18 @@ class CSVViewer(tk.Tk):
             current_x = 0
             row_data = self.csv_data[row_idx]
 
+            # Highlight selected cell
+            if row_idx == self.selected_cell['row']:
+                 col_to_highlight = self.selected_cell['col']
+                 highlight_x = sum(self.col_widths.get(i, 100) for i in range(col_to_highlight))
+                 highlight_width = self.col_widths.get(col_to_highlight, 100)
+                 self.canvas.create_rectangle(
+                    highlight_x + x_offset, y,
+                    highlight_x + highlight_width + x_offset, y + self.row_height,
+                    fill="#cce5ff", # A light blue color for selection
+                    outline="#0078d7"
+                )
+
             for col_idx, cell_value in enumerate(row_data):
                 col_width = self.col_widths.get(col_idx, 100)
                 
@@ -374,6 +394,7 @@ class CSVViewer(tk.Tk):
             if any(search_term in str(cell).lower() for cell in row)
         ]
         self.csv_data = filtered_data
+        self.selected_cell = {'row': None, 'col': None} # Reset selection
         
         self.after(0, self.setup_display)
         self.after(0, lambda: self.status_bar.config(text=f"Found {len(self.csv_data):,} matching rows."))
@@ -384,6 +405,7 @@ class CSVViewer(tk.Tk):
         if not self.original_data:
             return
         self.csv_data = self.original_data[:]
+        self.selected_cell = {'row': None, 'col': None} # Reset selection
         self.status_bar.config(text="Filter cleared.")
         self.setup_display()
 
@@ -401,6 +423,43 @@ class CSVViewer(tk.Tk):
             fraction = (line_num - 1) / self.total_rows if self.total_rows > 0 else 0
             self.canvas.yview_moveto(fraction)
             self.redraw_canvas()
+
+    def copy_selection(self):
+        """Copies the content of the selected cell to the clipboard."""
+        sel = self.selected_cell
+        if sel['row'] is not None and sel['col'] is not None:
+            try:
+                value = self.csv_data[sel['row']][sel['col']]
+                self.clipboard_clear()
+                self.clipboard_append(value)
+                self.status_bar.config(text=f"Copied '{value}' to clipboard.")
+            except IndexError:
+                self.status_bar.config(text="Cannot copy cell, data out of sync.")
+
+    def _on_cell_click(self, event):
+        """Handles clicks on the canvas to select a cell."""
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+
+        row = int(canvas_y // self.row_height)
+        
+        current_x = 0
+        col = None
+        # Find column by iterating through widths
+        for i in range(len(self.column_names)):
+            col_width = self.col_widths.get(i, 100)
+            if current_x <= canvas_x < current_x + col_width:
+                col = i
+                break
+            current_x += col_width
+
+        if row < len(self.csv_data) and col is not None:
+            self.selected_cell = {'row': row, 'col': col}
+        else:
+            # Deselect if clicking outside data area
+            self.selected_cell = {'row': None, 'col': None}
+        
+        self.redraw_canvas()
 
     def show_about(self):
         """Shows the about dialog."""
@@ -426,6 +485,8 @@ if __name__ == "__main__":
         app.after(100, lambda: app.load_file_from_path(file_to_open))
 
     app.mainloop()
+
+
 
 
 
