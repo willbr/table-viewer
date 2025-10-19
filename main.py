@@ -330,9 +330,21 @@ class CSVViewer(tk.Tk):
             if self.sort_info['col_index'] == i:
                 text += ' ▲' if self.sort_info['ascending'] else ' ▼'
             
+            align = self.col_alignments.get(i, 'w')
+            padding = 10 # Padding from the edge of the column
+
+            if align == 'e':
+                anchor = 'e'
+                # Position text at the right edge of the column, minus padding
+                text_x = current_x + x_offset + col_width - padding
+            else:  # Default to 'w'
+                anchor = 'w'
+                # Position text at the left edge of the column, plus padding
+                text_x = current_x + x_offset + padding
+
             self.header_canvas.create_text(
-                current_x + x_offset + 10, self.header_canvas.winfo_height()/2,
-                text=text, anchor='w', font=self.header_font,
+                text_x, self.header_canvas.winfo_height()/2,
+                text=text, anchor=anchor, font=self.header_font,
                 fill=self.FOREGROUND_COLOR
             )
             current_x += col_width
@@ -579,4 +591,5 @@ if __name__ == "__main__":
         app.after(100, lambda: app.load_file_from_path(file_to_open))
 
     app.mainloop()
+
 
