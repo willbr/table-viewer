@@ -66,7 +66,7 @@ class CSVViewer(tk.Tk):
         
         edit_menu = tk.Menu(menu_bar, tearoff=0)
         edit_menu.add_command(label="Find/Filter...", command=self.find_data, accelerator=f"{self.modifier}+F")
-        edit_menu.add_command(label="Clear Filter", command=self.clear_filter)
+        edit_menu.add_command(label="Clear Filter", command=self.clear_filter, accelerator="Esc")
         edit_menu.add_command(label="Go to Line...", command=self.go_to_line, accelerator=f"{self.modifier}+G")
         edit_menu.add_separator()
         edit_menu.add_command(label="Copy", command=self.copy_selection, accelerator=f"{self.modifier}+C")
@@ -81,6 +81,7 @@ class CSVViewer(tk.Tk):
         self.bind(f"<{self.modifier}-f>", lambda event: self.find_data())
         self.bind(f"<{self.modifier}-g>", lambda event: self.go_to_line())
         self.bind(f"<{self.modifier}-c>", lambda event: self.copy_selection())
+        self.bind("<Escape>", lambda event: self.clear_filter())
 
     def _create_widgets(self):
         """Creates the main widgets, replacing Treeview with a Canvas."""
@@ -435,6 +436,7 @@ class CSVViewer(tk.Tk):
         ]
         self.csv_data = filtered_data
         self.selected_cell = {'row': None, 'col': None} # Reset selection
+        self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
         
         self.after(0, self.setup_display)
         self.after(0, lambda: self.status_bar.config(text=f"Found {len(self.csv_data):,} matching rows."))
@@ -446,6 +448,7 @@ class CSVViewer(tk.Tk):
             return
         self.csv_data = self.original_data[:]
         self.selected_cell = {'row': None, 'col': None} # Reset selection
+        self.sort_info = {'col_index': None, 'ascending': True} # Reset sort
         self.status_bar.config(text="Filter cleared.")
         self.setup_display()
 
@@ -541,4 +544,6 @@ if __name__ == "__main__":
         app.after(100, lambda: app.load_file_from_path(file_to_open))
 
     app.mainloop()
+
+
 
