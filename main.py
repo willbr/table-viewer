@@ -175,7 +175,7 @@ class CSVViewer(tk.Tk):
             self.after_cancel(self._redraw_job)
         # Use a minimal delay to allow multiple scroll events in one event loop
         # cycle to be handled by a single redraw.
-        self._redraw_job = self.after(5, self._perform_redraw)
+        self._redraw_job = self.after(0, self._perform_redraw)
 
     def _perform_redraw(self):
         """Executes the actual redraw of the canvas and header."""
@@ -787,9 +787,7 @@ class CSVViewer(tk.Tk):
 if __name__ == "__main__":
     app = CSVViewer()
     if len(sys.argv) > 1:
-        app.after(100, lambda: app.load_file_from_path(sys.argv[1]))
+        app.after(0, lambda: app.load_file_from_path(sys.argv[1]))
     app.update()
     app.mainloop()
-
-
 
