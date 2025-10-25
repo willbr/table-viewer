@@ -1,13 +1,11 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog, font as tkFont
-import csv
 import threading
 import sys
 import os
 import subprocess
 import time
 import pandas as pd
-from datetime import datetime
 
 class CSVViewer(tk.Tk):
     """
@@ -29,13 +27,6 @@ class CSVViewer(tk.Tk):
         self.mono_font = tkFont.Font(family="Courier New", size=12)
         self.header_font = tkFont.Font(family="Helvetica", size=12, weight="bold")
         
-        # Common date and datetime formats to check against
-        self.DATETIME_FORMATS = [
-            '%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S', '%Y-%m-%d %H:%M',
-            '%m/%d/%Y %I:%M %p', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d',
-            '%m/%d/%Y', '%m-%d-%Y', '%Y/%m/%d', '%d-%m-%Y', '%d/%m/%Y'
-        ]
-
         self.file_path = None
         self.original_data = pd.DataFrame() # Holds the original, unfiltered data as a DataFrame
         self.view_df = pd.DataFrame() # Holds the current view (sorted or filtered) of the data
@@ -54,6 +45,15 @@ class CSVViewer(tk.Tk):
         self._redraw_job = None # For debouncing redraw calls
         self.sort_thread = None # To manage sort thread
         self.filter_thread = None # To manage filter thread
+        
+        # --- Column Resizing State ---
+        self.resizing_col_index = None
+        self.resize_start_x = 0
+        self.initial_col_width = 0
+        self.potential_sort_click = False # Differentiates a click from a drag
+        self.last_press_time = 0
+        self.last_press_col = None
+        self.auto_fit_thread = None # To manage auto-fit thread
 
         self.config(bg=self.BACKGROUND_COLOR)
         self._create_menu()
@@ -131,7 +131,12 @@ class CSVViewer(tk.Tk):
 
         self.header_canvas = tk.Canvas(main_frame, height=25, bd=0, highlightthickness=0, bg=self.BACKGROUND_COLOR)
         self.header_canvas.grid(row=0, column=0, sticky="ew")
-        self.header_canvas.bind("<Button-1>", self._on_header_click)
+        
+        # --- Bindings for Column Resizing and Sorting ---
+        self.header_canvas.bind("<Motion>", self._on_header_motion)
+        self.header_canvas.bind("<ButtonPress-1>", self._on_header_press)
+        self.header_canvas.bind("<B1-Motion>", self._on_header_drag)
+        self.header_canvas.bind("<ButtonRelease-1>", self._on_header_release)
         
         self.canvas = tk.Canvas(main_frame, bg=self.BACKGROUND_COLOR, highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
@@ -158,7 +163,7 @@ class CSVViewer(tk.Tk):
             self.after_cancel(self._redraw_job)
         # Use a minimal delay to allow multiple scroll events in one event loop
         # cycle to be handled by a single redraw.
-        self._redraw_job = self.after(1, self._perform_redraw)
+        self._redraw_job = self.after(5, self._perform_redraw)
 
     def _perform_redraw(self):
         """Executes the actual redraw of the canvas and header."""
@@ -196,6 +201,9 @@ class CSVViewer(tk.Tk):
         
         thread = threading.Thread(target=self._load_csv_data, daemon=True)
         thread.start()
+        self.status_bar.config(text=f"Opening {self.file_path}....")
+        self.update_idletasks()
+        self.deiconify()
 
     def _reset_state(self):
         """Resets the application state for a new file."""
@@ -206,12 +214,19 @@ class CSVViewer(tk.Tk):
         self.features_ready = False
         self.edit_menu.entryconfig("Find/Filter...", state="disabled")
         self.edit_menu.entryconfig("Clear Filter", state="disabled")
+        self.last_press_time = 0
+        self.last_press_col = None
+        self.auto_fit_thread = None
 
     def _load_csv_data(self):
         """Loads data in two stages using pandas for speed and robustness."""
-        INITIAL_LOAD_ROWS = 2000
-        CHUNK_SIZE = 10000 
+        INITIAL_LOAD_ROWS = 200
+        CHUNK_SIZE = 50000 
+        self.after(0, lambda: self.status_bar.config(text=f"loading csv data"))
         try:
+            # --- PROFILING: Mark start time ---
+            t_start_full = time.perf_counter()
+
             # --- Stage 1: Fast initial read using nrows for instant display ---
             initial_chunk_df = pd.read_csv(
                 self.file_path,
@@ -220,16 +235,30 @@ class CSVViewer(tk.Tk):
                 on_bad_lines='skip',
                 engine='c'
             )
+            self.after(0, lambda: self.status_bar.config(text=f"initial chunk read"))
+            
+            # --- PROFILING: Mark chunk load time ---
+            t_end_chunk = time.perf_counter()
+            chunk_load_time = t_end_chunk - t_start_full
+            print(f"--- STAGE 1 (Initial Chunk) loaded in: {chunk_load_time:.4f} seconds ---")
             
             self.column_names = initial_chunk_df.columns.tolist()
+            self.after(0, lambda: self.status_bar.config(text=f"col names"))
             self.original_data = initial_chunk_df
             self.view_df = self.original_data
             
             self.total_rows = len(self.view_df)
 
             self._detect_column_types(initial_chunk_df)
+            self.after(0, lambda: self.status_bar.config(text=f"detect col types"))
+
             self._estimate_col_widths(self.view_df) # Pass the DataFrame directly
+            self.after(0, lambda: self.status_bar.config(text=f"estimate widths"))
+
             self.after(0, self.setup_display)
+            self.after(0, lambda: self.status_bar.config(text=f"setup display"))
+
+            time.sleep(0.01) # Yield to the UI thread
             self.after(0, lambda: self.status_bar.config(text=f"Showing first {self.total_rows:,} rows. Loading full file..."))
             
             # --- Stage 2: Create a new iterator to load the rest of the file ---
@@ -251,6 +280,11 @@ class CSVViewer(tk.Tk):
                 time.sleep(0.001) # Yield to the UI thread
             
             self.original_data = pd.concat(chunk_dfs, ignore_index=True)
+
+            # --- PROFILING: Mark full load time ---
+            t_end_full = time.perf_counter()
+            full_load_time = t_end_full - t_start_full
+            print(f"--- STAGE 2 (Full File) loaded in: {full_load_time:.4f} seconds ---")
 
             self.after(0, self._finalize_load)
 
@@ -326,12 +360,23 @@ class CSVViewer(tk.Tk):
                 self.col_alignments[i] = 'w'
 
     def setup_display(self):
+        self.after(0, lambda: self.status_bar.config(text=f"setup display"))
         self._redraw_header()
+        self.after(0, lambda: self.status_bar.config(text=f"redraw header"))
+        self.update_scrollregion()
+        self.redraw_canvas()
+        self.after(0, lambda: self.status_bar.config(text=f"redraw canvas"))
+        self.update_idletasks()
+        self.deiconify()
+        self.focus_force()
+        self.after(0, lambda: self.status_bar.config(text=f"end setup display"))
+
+    def update_scrollregion(self):
+        """Recalculates and sets the scrollregion for header and data canvases."""
         total_width = sum(self.col_widths.values())
         total_height = self.total_rows * self.row_height
         self.canvas.configure(scrollregion=(0, 0, total_width, total_height))
         self.header_canvas.configure(scrollregion=(0, 0, total_width, self.header_canvas.winfo_height()))
-        self.redraw_canvas()
 
     def _redraw_header(self):
         self.header_canvas.delete("all")
@@ -339,6 +384,9 @@ class CSVViewer(tk.Tk):
         scroll_width = sum(self.col_widths.values())
         x_offset = -int(x_left * scroll_width)
         current_x = 0
+        
+        canvas_height = self.header_canvas.winfo_height() # Get canvas height
+
         for i, col_name in enumerate(self.column_names):
             col_width = self.col_widths.get(i, 100)
             text = col_name
@@ -352,8 +400,16 @@ class CSVViewer(tk.Tk):
             else:
                 anchor, text_x = 'w', current_x + x_offset + padding
 
-            self.header_canvas.create_text(text_x, self.header_canvas.winfo_height()/2,
+            self.header_canvas.create_text(text_x, canvas_height / 2,
                 text=text, anchor=anchor, font=self.header_font, fill=self.FOREGROUND_COLOR)
+            
+            # --- ADD VERTICAL LINE ---
+            # Draw a divider line at the end of this column
+            line_x = current_x + col_width + x_offset
+            # Add a small padding from top and bottom
+            self.header_canvas.create_line(line_x, 4, line_x, canvas_height - 4, fill=self.GRID_LINE_COLOR)
+            # --- END ADD ---
+
             current_x += col_width
 
     def redraw_canvas(self, event=None):
@@ -384,10 +440,10 @@ class CSVViewer(tk.Tk):
 
             current_x = 0
             if row_idx == self.selected_cell['row']:
-                 col_to_highlight = self.selected_cell['col']
-                 highlight_x = sum(self.col_widths.get(j, 100) for j in range(col_to_highlight))
-                 highlight_width = self.col_widths.get(col_to_highlight, 100)
-                 self.canvas.create_rectangle(highlight_x + x_offset, y,
+                col_to_highlight = self.selected_cell['col']
+                highlight_x = sum(self.col_widths.get(j, 100) for j in range(col_to_highlight))
+                highlight_width = self.col_widths.get(col_to_highlight, 100)
+                self.canvas.create_rectangle(highlight_x + x_offset, y,
                     highlight_x + highlight_width + x_offset, y + self.row_height,
                     fill=self.SELECTION_COLOR, outline="")
 
@@ -399,8 +455,11 @@ class CSVViewer(tk.Tk):
                     font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
                     
                     display_value = str(cell_value)
-                    if col_type == 'float':
-                        try: display_value = f"{float(str(cell_value).replace(',', '')):.2f}"
+                    if col_type == 'int':
+                        try: display_value = f"{int(cell_value):,}"
+                        except (ValueError, TypeError): pass
+                    elif col_type == 'float':
+                        try: display_value = f"{float(cell_value):,.2f}"
                         except (ValueError, TypeError): pass
 
                     padding = 5
@@ -461,8 +520,8 @@ class CSVViewer(tk.Tk):
 
     def find_data(self):
         if not self.features_ready:
-             self.status_bar.config(text="Please wait for data to load before filtering.")
-             return
+            self.status_bar.config(text="Please wait for data to load before filtering.")
+            return
         
         # --- Thread Safety Guard ---
         if self.filter_thread and self.filter_thread.is_alive():
@@ -478,10 +537,10 @@ class CSVViewer(tk.Tk):
 
     def _perform_filter(self, search_term):
         """Performs filtering using pandas for efficiency."""
+        t_start_full = time.perf_counter()
+
         # This optimized approach converts each column to string once, which is much faster.
-        mask = self.original_data.apply(
-            lambda col: col.astype(str).str.contains(search_term, case=False, na=False)
-        ).any(axis=1)
+        mask = self.original_data.astype(str).apply(lambda s: s.str.contains(search_term, case=False, na=False)).any(axis=1)
         
         self.view_df = self.original_data[mask]
         self.total_rows = len(self.view_df)
@@ -489,8 +548,10 @@ class CSVViewer(tk.Tk):
         self.selected_cell = {'row': None, 'col': None}
         self.sort_info = {'col_index': None, 'ascending': True}
         
+        t_end_full = time.perf_counter()
+        filter_time = t_end_full - t_start_full
         self.after(0, self.setup_display)
-        self.after(0, lambda: self.status_bar.config(text=f"Found {self.total_rows:,} matching rows."))
+        self.after(0, lambda: self.status_bar.config(text=f"Found {self.total_rows:,} matching rows. {filter_time:.4f} seconds"))
 
     def clear_filter(self):
         if not self.features_ready: return
@@ -527,8 +588,104 @@ class CSVViewer(tk.Tk):
             except IndexError:
                 self.status_bar.config(text="Cannot copy cell, data out of sync.")
 
-    def _on_header_click(self, event):
+    def _get_resize_col(self, canvas_x):
+        """Checks if the mouse x-coordinate is over a column divider."""
+        current_x = 0
+        tolerance = 5 # Pixels
+        for i in range(len(self.column_names)):
+            col_width = self.col_widths.get(i, 100)
+            divider_x = current_x + col_width
+            if abs(canvas_x - divider_x) < tolerance:
+                return i # Return the index of the column to resize
+            current_x += col_width
+        return None
+
+    def _on_header_motion(self, event):
+        """Changes the cursor if hovering over a column divider."""
+        if self.resizing_col_index is not None:
+            return # Already resizing
+            
         canvas_x = self.header_canvas.canvasx(event.x)
+        col_to_resize = self._get_resize_col(canvas_x)
+        
+        if col_to_resize is not None:
+            self.header_canvas.config(cursor="sb_h_double_arrow")
+        else:
+            self.header_canvas.config(cursor="")
+
+    def _on_header_press(self, event):
+        """Starts a column resize, auto-fit, or flags a potential sort click."""
+        canvas_x = self.header_canvas.canvasx(event.x)
+        col_to_resize = self._get_resize_col(canvas_x)
+        
+        current_time = time.time()
+        time_diff = current_time - self.last_press_time
+        
+        # --- Check for double-click auto-fit ---
+        if col_to_resize is not None and col_to_resize == self.last_press_col and time_diff < 0.3: # 0.3 sec threshold
+            if self.auto_fit_thread and self.auto_fit_thread.is_alive():
+                return # Already auto-fitting
+            
+            self.auto_fit_column(col_to_resize)
+            
+            # Reset state
+            self.last_press_time = 0
+            self.last_press_col = None
+            self.potential_sort_click = False
+            self.resizing_col_index = None
+            return # Handled as auto-fit
+        
+        # --- Not a double-click, record press time & col ---
+        self.last_press_time = current_time
+        self.last_press_col = col_to_resize # Will be None if not on a divider
+
+        # --- Original press logic ---
+        self.resizing_col_index = None
+        self.potential_sort_click = False
+        
+        if col_to_resize is not None:
+            # This is a *single* press on a divider, init resize
+            self.resizing_col_index = col_to_resize
+            self.resize_start_x = event.x
+            self.initial_col_width = self.col_widths.get(col_to_resize, 100)
+        else:
+            # This is a press in the middle of a header, init sort
+            self.potential_sort_click = True
+            self.potential_sort_x = canvas_x
+
+    def _on_header_drag(self, event):
+        """Handles the drag motion to resize a column."""
+        if self.resizing_col_index is None:
+            return
+            
+        # It's a drag, so definitely not a sort click
+        self.potential_sort_click = False 
+        
+        delta_x = event.x - self.resize_start_x
+        new_width = self.initial_col_width + delta_x
+        new_width = max(20, new_width) # Set a minimum width
+        
+        self.col_widths[self.resizing_col_index] = new_width
+        
+        self.update_scrollregion()
+        self._schedule_redraw() # Debounced redraw
+
+    def _on_header_release(self, event):
+        """Finishes a resize or triggers a sort if it was a click."""
+        if self.resizing_col_index is not None:
+            # Finalize resize
+            self.resizing_col_index = None
+            self.header_canvas.config(cursor="")
+            self._perform_redraw() # Do one final, non-debounced redraw
+            
+        elif self.potential_sort_click:
+            # It was a click (press and release), so trigger the sort
+            self._on_header_click_logic(self.potential_sort_x)
+
+        self.potential_sort_click = False
+
+    def _on_header_click_logic(self, canvas_x):
+        """Finds which column was clicked and triggers a sort."""
         current_x, col = 0, None
         for i in range(len(self.column_names)):
             col_width = self.col_widths.get(i, 100)
@@ -537,6 +694,59 @@ class CSVViewer(tk.Tk):
                 break
             current_x += col_width
         if col is not None: self.sort_by_column(col)
+
+    def auto_fit_column(self, col_index):
+        """Starts a background thread to auto-fit a column."""
+        if not self.features_ready:
+            self.status_bar.config(text="Please wait for data to load before auto-fitting.")
+            return
+
+        if self.auto_fit_thread and self.auto_fit_thread.is_alive():
+            self.status_bar.config(text="Auto-fit already in progress...")
+            return
+            
+        col_name = self.column_names[col_index]
+        self.status_bar.config(text=f"Auto-fitting column '{col_name}'...")
+        self.auto_fit_thread = threading.Thread(target=self._perform_auto_fit, args=(col_index,), daemon=True)
+        self.auto_fit_thread.start()
+
+    def _perform_auto_fit(self, col_index):
+        """(Threaded) Calculates the optimal width for a column based on all data."""
+        try:
+            col_name = self.column_names[col_index]
+            col_type = self.col_types.get(col_index, 'text')
+            font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
+            
+            # 1. Get header width
+            header_width = self.header_font.measure(col_name) + 30 # Padding + sort arrow
+
+            # 2. Get max data width from original_data
+            # This is the most expensive operation
+            s = self.original_data[col_name].astype(str)
+            
+            if s.empty:
+                max_data_width = 0
+            else:
+                # Find the string with the max character length (fast proxy)
+                # and measure just that one string (slower, but only done once)
+                value_to_measure = s.loc[s.str.len().idxmax()]
+                max_data_width = font_to_use.measure(value_to_measure) + 15 # Cell padding
+
+            # 3. Determine new width
+            new_width = int(max(header_width, max_data_width, 50)) # Min width of 50
+            self.col_widths[col_index] = new_width
+            
+            # 4. Schedule UI update
+            self.after(0, self._finalize_auto_fit)
+        except Exception as e:
+            print(f"Error during auto-fit: {e}")
+            self.after(0, lambda: self.status_bar.config(text=f"Auto-fit failed: {e}"))
+
+    def _finalize_auto_fit(self):
+        """(Main Thread) Updates UI after auto-fit calculation is done."""
+        self.update_scrollregion()
+        self._perform_redraw()
+        self.status_bar.config(text="Auto-fit complete.")
 
     def _on_cell_click(self, event):
         canvas_x = self.canvas.canvasx(event.x)
@@ -566,14 +776,8 @@ if __name__ == "__main__":
     app = CSVViewer()
     if len(sys.argv) > 1:
         app.after(100, lambda: app.load_file_from_path(sys.argv[1]))
+    app.update()
     app.mainloop()
-
-
-
-
-
-
-
 
 
 
