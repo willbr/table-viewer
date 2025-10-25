@@ -385,6 +385,15 @@ class CSVViewer(tk.Tk):
                 # 4. Get the actual longest string
                 value_to_measure = str_series.loc[longest_str_index]
                 
+                # --- FIX: Apply the same formatting as redraw_canvas ---
+                if col_type == 'int':
+                    try: value_to_measure = f"{int(float(value_to_measure)):,}"
+                    except (ValueError, TypeError): pass # Keep original string if conversion fails
+                elif col_type == 'float':
+                    try: value_to_measure = f"{float(value_to_measure):,.2f}"
+                    except (ValueError, TypeError): pass # Keep original string
+                # --- END FIX ---
+
                 # 5. Measure only ONCE
                 max_data_width = font_to_use.measure(value_to_measure) + 15
             # --- End Optimization ---
@@ -587,7 +596,12 @@ class CSVViewer(tk.Tk):
             self.view_df = sorted_df
 
             self.after(0, self.setup_display)
-            self.after(0, lambda: self.status_bar.config(text="Sort complete."))
+            
+            # --- MODIFICATION: Trigger auto-fit after sort ---
+            self.after(0, lambda: self.status_bar.config(text="Sort complete. Auto-fitting column..."))
+            self.after(0, self.auto_fit_column, col_index)
+            # --- END MODIFICATION ---
+            
         except Exception as e:
             self.after(0, lambda err=e: messagebox.showerror("Sort Error", f"An error occurred: {err}"))
 
@@ -803,6 +817,16 @@ class CSVViewer(tk.Tk):
                 # Find the string with the max character length (fast proxy)
                 # and measure just that one string (slower, but only done once)
                 value_to_measure = s.loc[s.str.len().idxmax()]
+                
+                # --- FIX: Apply the same formatting as redraw_canvas ---
+                if col_type == 'int':
+                    try: value_to_measure = f"{int(float(value_to_measure)):,}"
+                    except (ValueError, TypeError): pass # Keep original string if conversion fails
+                elif col_type == 'float':
+                    try: value_to_measure = f"{float(value_to_measure):,.2f}"
+                    except (ValueError, TypeError): pass # Keep original string
+                # --- END FIX ---
+                
                 max_data_width = font_to_use.measure(value_to_measure) + 15 # Cell padding
 
             # 3. Determine new width
@@ -863,4 +887,6 @@ if __name__ == "__main__":
         app.load_file_from_path(file_to_open)
     
     app.mainloop()
+
+
 
