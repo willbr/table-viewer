@@ -15,7 +15,19 @@ class CSVViewer(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Fast CSV Viewer")
-        self.geometry("800x600")
+        
+        # Calculate screen dimensions and set window size
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        
+        window_width = int(screen_width * 0.6)
+        window_height = int(screen_height * 0.8)
+        
+        # Calculate position for centering
+        x_cordinate = int((screen_width / 2) - (window_width / 2))
+        y_cordinate = int((screen_height / 2) - (window_height / 2))
+        
+        self.geometry(f"{window_width}x{window_height}+{x_cordinate}+{y_cordinate}")
 
         self.modifier = "Command" if sys.platform == "darwin" else "Control"
 
