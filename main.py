@@ -12,7 +12,7 @@ class CSVViewer(tk.Tk):
     A fast and simple CSV viewer application built with Tkinter.
     It uses a virtualized canvas and two-stage loading with pandas to display large CSV files.
     """
-    def __init__(self):
+    def __init__(self, debug_colors=False):
         super().__init__()
         self.title("Fast CSV Viewer")
         
@@ -30,6 +30,13 @@ class CSVViewer(tk.Tk):
         self.geometry(f"{window_width}x{window_height}+{x_cordinate}+{y_cordinate}")
 
         self.modifier = "Command" if sys.platform == "darwin" else "Control"
+        
+        self.debug_colors = debug_colors # Store the CLI flag
+
+        # --- Debug Colors ---
+        self.DEBUG_COLOR_START = '#FFCCCC' # Light Red
+        self.DEBUG_COLOR_STAGE1 = '#FFFFCC' # Light Yellow
+        # --- End Debug Colors ---
 
         # --- Setup Theme and Colors ---
         self._setup_theme_colors()
@@ -71,6 +78,9 @@ class CSVViewer(tk.Tk):
         self._create_menu()
         self._create_widgets()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        # Start hidden, we will show it once data is ready
+        # self.withdraw() # <-- REVERTED: Removing this line
 
     def _setup_theme_colors(self):
         """Sets up theme-aware colors, with a special check for macOS dark mode."""
@@ -141,7 +151,9 @@ class CSVViewer(tk.Tk):
         main_frame.rowconfigure(1, weight=1)
         main_frame.columnconfigure(0, weight=1)
 
-        self.header_canvas = tk.Canvas(main_frame, height=25, bd=0, highlightthickness=0, bg=self.BACKGROUND_COLOR)
+        # DEBUG: Use start color if debugging, else normal
+        bg_color = self.DEBUG_COLOR_START if self.debug_colors else self.BACKGROUND_COLOR
+        self.header_canvas = tk.Canvas(main_frame, height=25, bd=0, highlightthickness=0, bg=bg_color)
         self.header_canvas.grid(row=0, column=0, sticky="ew")
         
         # --- Bindings for Column Resizing and Sorting ---
@@ -150,7 +162,8 @@ class CSVViewer(tk.Tk):
         self.header_canvas.bind("<B1-Motion>", self._on_header_drag)
         self.header_canvas.bind("<ButtonRelease-1>", self._on_header_release)
         
-        self.canvas = tk.Canvas(main_frame, bg=self.BACKGROUND_COLOR, highlightthickness=0)
+        # DEBUG: Use start color if debugging, else normal
+        self.canvas = tk.Canvas(main_frame, bg=bg_color, highlightthickness=0)
         self.canvas.grid(row=1, column=0, sticky="nsew")
 
         vsb = ttk.Scrollbar(main_frame, orient="vertical", command=self.on_vscroll)
@@ -182,6 +195,15 @@ class CSVViewer(tk.Tk):
         self._redraw_job = None
         self._redraw_header()
         self.redraw_canvas()
+
+    def _set_debug_colors(self, color):
+        """(Main Thread) Sets the background color of canvases for debugging."""
+        try:
+            self.canvas.config(bg=color)
+            self.header_canvas.config(bg=color)
+        except tk.TclError as e:
+            # This can happen if the window is closed during load
+            print(f"Failed to set debug color (window likely closed): {e}")
 
     def on_vscroll(self, *args):
         self.canvas.yview(*args)
@@ -215,10 +237,18 @@ class CSVViewer(tk.Tk):
         thread.start()
         self.status_bar.config(text=f"Opening {self.file_path}....")
         self.update_idletasks()
-        self.deiconify()
+        # self.deiconify() # <-- This is redundant, mainloop shows the window.
+        # The window will be shown in setup_display() after Stage 1 load.
 
     def _reset_state(self):
         """Resets the application state for a new file."""
+        
+        # DEBUG: Reset background to start color or normal
+        if self.debug_colors:
+            self._set_debug_colors(self.DEBUG_COLOR_START)
+        else:
+            self._set_debug_colors(self.BACKGROUND_COLOR)
+        
         self.original_data = pd.DataFrame()
         self.view_df = pd.DataFrame()
         self.column_names = []
@@ -247,7 +277,7 @@ class CSVViewer(tk.Tk):
                 on_bad_lines='skip',
                 engine='c'
             )
-            self.after(0, lambda: self.status_bar.config(text=f"initial chunk read"))
+            #self.after(0, lambda: self.status_bar.config(text=f"initial chunk read"))
             
             # --- PROFILING: Mark chunk load time ---
             t_end_chunk = time.perf_counter()
@@ -255,20 +285,24 @@ class CSVViewer(tk.Tk):
             print(f"--- STAGE 1 (Initial Chunk) loaded in: {chunk_load_time:.4f} seconds ---")
             
             self.column_names = initial_chunk_df.columns.tolist()
-            self.after(0, lambda: self.status_bar.config(text=f"col names"))
+            #self.after(0, lambda: self.status_bar.config(text=f"col names"))
             self.original_data = initial_chunk_df
             self.view_df = self.original_data
             
             self.total_rows = len(self.view_df)
 
+            #self.after(0, lambda: self.status_bar.config(text=f"detect col types"))
             self._detect_column_types(initial_chunk_df)
-            self.after(0, lambda: self.status_bar.config(text=f"detect col types"))
 
+            #self.after(0, lambda: self.status_bar.config(text=f"estimate widths"))
             self._estimate_col_widths(self.view_df) # Pass the DataFrame directly
-            self.after(0, lambda: self.status_bar.config(text=f"estimate widths"))
 
+            # DEBUG: Set background to yellow for Stage 1 display
+            if self.debug_colors:
+                self.after(0, self._set_debug_colors, self.DEBUG_COLOR_STAGE1)
+
+            #self.after(0, lambda: self.status_bar.config(text=f"setup display"))
             self.after(0, self.setup_display)
-            self.after(0, lambda: self.status_bar.config(text=f"setup display"))
 
             time.sleep(0.01) # Yield to the UI thread
             self.after(0, lambda: self.status_bar.config(text=f"Showing first {self.total_rows:,} rows. Loading full file..."))
@@ -305,6 +339,10 @@ class CSVViewer(tk.Tk):
 
     def _finalize_load(self):
         """Called after the full file is loaded and features are enabled."""
+        
+        # DEBUG: Set background back to normal
+        self._set_debug_colors(self.BACKGROUND_COLOR)
+        
         self.total_rows = len(self.original_data)
         self.view_df = self.original_data
         
@@ -319,20 +357,42 @@ class CSVViewer(tk.Tk):
 
     def _estimate_col_widths(self, df):
         """Estimate column widths based on header and first 100 rows of a DataFrame."""
+        t_start = time.perf_counter() # --- PROFILING START ---
+        
         self.col_widths = {}
+        # Limit to the first 100 rows
+        df_sample = df.iloc[:100] 
+
         for i, col_name in enumerate(self.column_names):
             header_width = self.header_font.measure(col_name) + 30
-            max_data_width = 0
+            
             col_type = self.col_types.get(i, 'text')
             font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
             
-            # Use itertuples for memory-efficient iteration over the first 100 rows
-            for row in df.iloc[:100].itertuples(index=False, name=None):
-                if i < len(row):
-                    cell_value = str(row[i]) if pd.notna(row[i]) else ""
-                    cell_width = font_to_use.measure(cell_value) + 15
-                    if cell_width > max_data_width: max_data_width = cell_width
+            # --- Vectorized Optimization ---
+            # 1. Get the column's sample data
+            col_data = df_sample[col_name]
+            
+            if col_data.empty:
+                max_data_width = 0
+            else:
+                # 2. Convert all to string ONCE
+                str_series = col_data.astype(str)
+                
+                # 3. Find the index of the longest string
+                longest_str_index = str_series.str.len().idxmax()
+                
+                # 4. Get the actual longest string
+                value_to_measure = str_series.loc[longest_str_index]
+                
+                # 5. Measure only ONCE
+                max_data_width = font_to_use.measure(value_to_measure) + 15
+            # --- End Optimization ---
+
             self.col_widths[i] = max(header_width, max_data_width, 50)
+
+        t_end = time.perf_counter() # --- PROFILING END ---
+        print(f"--- _estimate_col_widths (Vectorized) executed in: {t_end - t_start:.4f} seconds ---")
 
     def _detect_column_types(self, df):
         """Uses pandas dtypes for robust and fast type detection."""
@@ -372,16 +432,17 @@ class CSVViewer(tk.Tk):
                 self.col_alignments[i] = 'w'
 
     def setup_display(self):
-        self.after(0, lambda: self.status_bar.config(text=f"setup display"))
+        #self.after(0, lambda: self.status_bar.config(text=f"setup display"))
         self._redraw_header()
-        self.after(0, lambda: self.status_bar.config(text=f"redraw header"))
+        #self.after(0, lambda: self.status_bar.config(text=f"redraw header"))
         self.update_scrollregion()
         self.redraw_canvas()
-        self.after(0, lambda: self.status_bar.config(text=f"redraw canvas"))
+        #self.after(0, lambda: self.status_bar.config(text=f"redraw canvas"))
         self.update_idletasks()
         self.deiconify()
+        self.lift()
         self.focus_force()
-        self.after(0, lambda: self.status_bar.config(text=f"end setup display"))
+        #self.after(0, lambda: self.status_bar.config(text=f"end setup display"))
 
     def update_scrollregion(self):
         """Recalculates and sets the scrollregion for header and data canvases."""
@@ -785,9 +846,21 @@ class CSVViewer(tk.Tk):
             "A simple, fast CSV viewer for large files.\n\nBuilt with Python and Tkinter.")
 
 if __name__ == "__main__":
-    app = CSVViewer()
-    if len(sys.argv) > 1:
-        app.after(0, lambda: app.load_file_from_path(sys.argv[1]))
-    app.update()
+    debug_mode = False
+    file_to_open = None
+    
+    # Parse CLI args
+    args = sys.argv[1:]
+    for arg in args:
+        if arg == '--debug-colors':
+            debug_mode = True
+        elif not arg.startswith('-'):
+            file_to_open = arg
+            
+    app = CSVViewer(debug_colors=debug_mode) # Pass the flag
+    
+    if file_to_open:
+        app.load_file_from_path(file_to_open)
+    
     app.mainloop()
 
