@@ -7,6 +7,13 @@ import subprocess
 import time
 import pandas as pd
 
+# --- 1. High DPI Support for Windows ---
+try:
+    from ctypes import windll
+    windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
 class CSVViewer(tk.Tk):
     """
     A fast and simple CSV viewer application built with Tkinter.
