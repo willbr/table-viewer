@@ -64,7 +64,8 @@ class CSVViewer(tk.Tk):
         self._redraw_job = None
         self.sort_thread = None
         self.filter_thread = None
-        
+        self.auto_fit_thread = None
+
         # --- Column Resizing State ---
         self.resizing_col_index = None
         self.resize_start_x = 0
@@ -72,7 +73,6 @@ class CSVViewer(tk.Tk):
         self.potential_sort_click = False
         self.last_press_time = 0
         self.last_press_col = None
-        self.auto_fit_thread = None
 
         self.config(bg=self.BACKGROUND_COLOR)
         self._create_menu()
@@ -90,10 +90,11 @@ class CSVViewer(tk.Tk):
         is_dark_mode = False
         if sys.platform == "darwin":
             try:
-                cmd = 'defaults read -g AppleInterfaceStyle'
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-                output, _ = p.communicate()
-                if output.strip().decode() == 'Dark':
+                result = subprocess.run(
+                    ['defaults', 'read', '-g', 'AppleInterfaceStyle'],
+                    capture_output=True, text=True
+                )
+                if result.stdout.strip() == 'Dark':
                     is_dark_mode = True
             except Exception:
                 pass
@@ -200,8 +201,12 @@ class CSVViewer(tk.Tk):
         self._schedule_redraw()
 
     def _on_mousewheel(self, event):
-        if event.num == 5 or event.delta < 0: self.canvas.yview_scroll(1, "units")
-        elif event.num == 4 or event.delta > 0: self.canvas.yview_scroll(-1, "units")
+        if sys.platform == "darwin":
+            self.canvas.yview_scroll(-int(event.delta), "units")
+        elif event.num == 5 or event.delta < 0:
+            self.canvas.yview_scroll(3, "units")
+        elif event.num == 4 or event.delta > 0:
+            self.canvas.yview_scroll(-3, "units")
         self._schedule_redraw()
 
     def open_file(self):
@@ -234,49 +239,59 @@ class CSVViewer(tk.Tk):
         self.canvas.delete("all")
         self.header_canvas.delete("all")
 
+    def _read_csv(self, **kwargs):
+        """Read CSV with automatic encoding fallback."""
+        try:
+            return pd.read_csv(self.file_path, encoding='utf-8', **kwargs)
+        except UnicodeDecodeError:
+            return pd.read_csv(self.file_path, encoding='latin-1', **kwargs)
+
     def _load_csv_data(self):
         INITIAL_LOAD_ROWS = 200
-        CHUNK_SIZE = 50000 
-        
+        CHUNK_SIZE = 50000
+
         try:
             # Stage 1: Fast initial read
-            initial_chunk_df = pd.read_csv(
-                self.file_path, nrows=INITIAL_LOAD_ROWS, encoding='utf-8',
-                on_bad_lines='skip', engine='c'
+            initial_chunk_df = self._read_csv(
+                nrows=INITIAL_LOAD_ROWS, on_bad_lines='skip', engine='c'
             )
-            
-            self.column_names = initial_chunk_df.columns.tolist()
-            self.original_data = initial_chunk_df
-            self.view_df = self.original_data
-            self.total_rows = len(self.view_df)
 
+            column_names = initial_chunk_df.columns.tolist()
             self._detect_column_types(initial_chunk_df)
-            self._estimate_col_widths(self.view_df)
-            self.after(0, self.setup_display)
+            self._estimate_col_widths(initial_chunk_df)
 
-            # Removed time.sleep() calls for cleaner threading
-            self.after(0, lambda: self.status_bar.config(text=f"Loaded preview. Reading full file..."))
-            
+            # Marshal state to main thread
+            def _apply_preview():
+                self.column_names = column_names
+                self.original_data = initial_chunk_df
+                self.view_df = self.original_data
+                self.total_rows = len(self.view_df)
+                self.setup_display()
+                self.status_bar.config(text="Loaded preview. Reading full file...")
+            self.after(0, _apply_preview)
+
             # Stage 2: Load rest
-            reader = pd.read_csv(
-                self.file_path, chunksize=CHUNK_SIZE, iterator=True, 
-                low_memory=False, encoding='utf-8', on_bad_lines='skip', 
+            reader = self._read_csv(
+                chunksize=CHUNK_SIZE, iterator=True,
+                low_memory=False, on_bad_lines='skip',
                 engine='c', header=0, skiprows=range(1, INITIAL_LOAD_ROWS + 1)
             )
-            
-            chunk_dfs = [self.original_data]
+
+            chunk_dfs = [initial_chunk_df]
             for chunk_df in reader:
                 chunk_dfs.append(chunk_df)
-            
-            self.original_data = pd.concat(chunk_dfs, ignore_index=True)
-            self.after(0, self._finalize_load)
+
+            full_data = pd.concat(chunk_dfs, ignore_index=True)
+            self.after(0, lambda: self._finalize_load(full_data))
 
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Error", f"Failed to read file: {e}"))
 
-    def _finalize_load(self):
-        self.total_rows = len(self.original_data)
+    def _finalize_load(self, full_data):
+        self.original_data = full_data
         self.view_df = self.original_data
+        self.total_rows = len(self.original_data)
+        self._estimate_col_widths(self.original_data)
         self.features_ready = True
         self.edit_menu.entryconfig("Find/Filter...", state="normal")
         self.edit_menu.entryconfig("Clear Filter", state="normal")
@@ -303,10 +318,10 @@ class CSVViewer(tk.Tk):
                 # Format check for accurate measurement
                 if col_type == 'int':
                     try: value_to_measure = f"{int(float(value_to_measure)):,}"
-                    except: pass
+                    except (ValueError, TypeError): pass
                 elif col_type == 'float':
                     try: value_to_measure = f"{float(value_to_measure):,.2f}"
-                    except: pass
+                    except (ValueError, TypeError): pass
 
                 max_data_width = font_to_use.measure(value_to_measure) + 15
 
@@ -405,33 +420,35 @@ class CSVViewer(tk.Tk):
 
             # 2. Draw Text
             current_x = 0
+            canvas_width = self.canvas.winfo_width()
             for col_idx, cell_value in enumerate(row_data):
                 col_width = self.col_widths.get(col_idx, 100)
-                
+                col_right = current_x + col_width + x_offset
+                col_left = current_x + x_offset
+
                 # Visibility Check
-                if (current_x + col_width + x_offset > 0) and (current_x + x_offset < self.canvas.winfo_width()):
+                if col_right > 0 and col_left < canvas_width:
                     align = self.col_alignments.get(col_idx, 'w')
                     col_type = self.col_types.get(col_idx, 'text')
                     font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
-                    
+
                     display_value = str(cell_value)
                     if col_type == 'int':
                         try: display_value = f"{int(cell_value):,}"
-                        except: pass
+                        except (ValueError, TypeError): pass
                     elif col_type == 'float':
                         try: display_value = f"{float(cell_value):,.2f}"
-                        except: pass
+                        except (ValueError, TypeError): pass
 
                     text_x = current_x + x_offset + (col_width - 5 if align == 'e' else 5)
                     anchor = 'e' if align == 'e' else 'w'
 
                     self.canvas.create_text(text_x, y + self.row_height / 2,
                         anchor=anchor, text=display_value, fill=self.FOREGROUND_COLOR, font=font_to_use)
-                
-                # Grid line
-                self.canvas.create_line(current_x + col_width + x_offset, y, 
-                                        current_x + col_width + x_offset, y + self.row_height, 
-                                        fill=self.GRID_LINE_COLOR)
+
+                    # Grid line (only for visible columns)
+                    self.canvas.create_line(col_right, y, col_right, y + self.row_height,
+                                            fill=self.GRID_LINE_COLOR)
 
                 current_x += col_width
             
@@ -456,21 +473,27 @@ class CSVViewer(tk.Tk):
         col_index = self.sort_info['col_index']
         ascending = self.sort_info['ascending']
         col_name = self.column_names[col_index]
-        
+
         try:
             col_type = self.col_types.get(col_index, 'text')
-            temp_df = self.view_df.copy()
+            df = self.view_df
 
             if col_type == 'datetime':
-                temp_df[col_name] = pd.to_datetime(temp_df[col_name], errors='coerce')
+                sort_key = pd.to_datetime(df[col_name], errors='coerce')
             elif col_type in ['int', 'float']:
-                temp_df[col_name] = pd.to_numeric(temp_df[col_name], errors='coerce')
-            
-            sorted_df = temp_df.sort_values(by=col_name, ascending=ascending, na_position='first')
-            self.view_df = sorted_df
+                sort_key = pd.to_numeric(df[col_name], errors='coerce')
+            else:
+                sort_key = df[col_name]
 
-            self.after(0, self.setup_display)
-            self.after(0, lambda: self.status_bar.config(text="Sort complete."))
+            sorted_df = df.iloc[sort_key.argsort(kind='mergesort')]
+            if not ascending:
+                sorted_df = sorted_df.iloc[::-1]
+
+            def _apply_sort():
+                self.view_df = sorted_df
+                self.setup_display()
+                self.status_bar.config(text="Sort complete.")
+            self.after(0, _apply_sort)
         except Exception as e:
             self.after(0, lambda err=e: messagebox.showerror("Sort Error", f"{err}"))
 
@@ -510,13 +533,17 @@ class CSVViewer(tk.Tk):
             # Combine with existing matches using logical OR
             mask |= col_matches
 
-        self.view_df = self.original_data[mask]
-        self.total_rows = len(self.view_df)
-        self.selected_cell = {'row': None, 'col': None}
-        
+        filtered_df = self.original_data[mask]
         t_end = time.perf_counter()
-        self.after(0, self.setup_display)
-        self.after(0, lambda: self.status_bar.config(text=f"Found {self.total_rows:,} matches in {t_end - t_start:.4f}s"))
+        match_count = len(filtered_df)
+
+        def _apply_filter():
+            self.view_df = filtered_df
+            self.total_rows = match_count
+            self.selected_cell = {'row': None, 'col': None}
+            self.setup_display()
+            self.status_bar.config(text=f"Found {match_count:,} matches in {t_end - t_start:.4f}s")
+        self.after(0, _apply_filter)
 
     def clear_filter(self):
         if not self.features_ready: return
@@ -531,7 +558,7 @@ class CSVViewer(tk.Tk):
         if self.original_data.empty: return
         line_num = simpledialog.askinteger("Go to Line", f"Row (1 - {self.total_rows}):", parent=self, minvalue=1, maxvalue=self.total_rows)
         if line_num:
-            fraction = (line_num - 1) / self.total_rows
+            fraction = max(0.0, min((line_num - 1) / max(self.total_rows, 1), 1.0 - 1e-9))
             self.canvas.yview_moveto(fraction)
             self.redraw_canvas()
 
@@ -625,9 +652,9 @@ class CSVViewer(tk.Tk):
             col_name = self.column_names[col_index]
             col_type = self.col_types.get(col_index, 'text')
             font_to_use = self.mono_font if col_type in ['int', 'float', 'datetime'] else self.default_font
-            
+
             header_width = self.header_font.measure(col_name) + 30
-            
+
             s = self.original_data[col_name].astype(str)
             if s.empty: max_data_width = 0
             else:
@@ -636,8 +663,8 @@ class CSVViewer(tk.Tk):
 
             self.col_widths[col_index] = min(max(header_width, max_data_width, 50), 500)
             self.after(0, self._finalize_auto_fit)
-        except Exception:
-            pass
+        except Exception as e:
+            self.after(0, lambda: self.status_bar.config(text=f"Auto-fit failed: {e}"))
 
     def _finalize_auto_fit(self):
         self.update_scrollregion()
