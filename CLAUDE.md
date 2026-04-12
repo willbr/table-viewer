@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Spirt
+
+1. Make the requrements less dumb
+2. Delete Part or Process Step
+3. Optimize
+4. Accelerate
+5. Automate
+
 ## Project Overview
 
 A fast CSV viewer desktop application built with Tkinter and pandas. Designed to handle large CSV files (100k+ rows) using virtualized rendering, pool-based canvas management, and two-stage loading.
