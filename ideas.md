@@ -1,16 +1,11 @@
-pandas category datatype
-downcast numeric types
-use a fixed pool of N rows, rather than deleting everything
-precompute col_x offsets array instead of summing per-row
-cache formatted cell strings to avoid repeated int/float formatting
-pre-stringify visible slice once instead of str() per cell
-row number gutter column
-keyboard navigation (arrow keys, page up/down, home/end)
-column-specific filter (filter on a single column instead of all)
-regex filter support
-export filtered view to new CSV
-drag-and-drop file open
-remember window size/position across sessions
-freeze/pin first N columns while scrolling horizontally
-text clipping with ellipsis when cell content overflows column width
-row striping (alternating row background colors)
+parquet file support
+json/jsonl file support
+multi-row selection (shift+click, cmd+click)
+copy entire row or column
+search highlight (show matches in-place instead of filtering)
+column statistics (right-click: count, min, max, avg, unique)
+resize all columns to fit (auto-fit all at once)
+horizontal mousewheel / trackpad scroll
+open recent files menu
+cell tooltip on hover for clipped text
+command-line flag to run a SQL query on a CSV

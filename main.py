@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 import json
+import sqlite3
 import pandas as pd
 
 # High DPI support for Windows
@@ -22,7 +23,7 @@ CONFIG_PATH = os.path.expanduser("~/.csv-viewer.json")
 class FilterDialog(tk.Toplevel):
     """Filter dialog with column selection and regex support."""
 
-    def __init__(self, parent, columns):
+    def __init__(self, parent, columns, default_column=None):
         super().__init__(parent)
         self.title("Find/Filter")
         self.transient(parent)
@@ -36,7 +37,7 @@ class FilterDialog(tk.Toplevel):
         self.entry.focus_set()
 
         tk.Label(self, text="In column:").grid(row=1, column=0, padx=8, pady=4, sticky="w")
-        self.column_var = tk.StringVar(value="All columns")
+        self.column_var = tk.StringVar(value=default_column or "All columns")
         ttk.Combobox(self, textvariable=self.column_var,
                      values=["All columns"] + list(columns), state="readonly").grid(
             row=1, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
@@ -68,18 +69,18 @@ class CSVViewer(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Fast CSV Viewer")
+        self.title("Table Viewer")
         self.modifier = "Command" if sys.platform == "darwin" else "Control"
 
         self._setup_theme_colors()
 
         # Fonts
-        self.default_font = tkFont.Font(
-            family="Segoe UI" if os.name == "nt" else "Helvetica", size=10)
-        self.mono_font = tkFont.Font(
-            family="Consolas" if os.name == "nt" else "Courier New", size=10)
-        self.header_font = tkFont.Font(
-            family="Segoe UI" if os.name == "nt" else "Helvetica", size=10, weight="bold")
+        self._font_size = 10
+        self._font_family = "Segoe UI" if os.name == "nt" else "Helvetica"
+        self._mono_family = "Consolas" if os.name == "nt" else "Courier New"
+        self.default_font = tkFont.Font(family=self._font_family, size=self._font_size)
+        self.mono_font = tkFont.Font(family=self._mono_family, size=self._font_size)
+        self.header_font = tkFont.Font(family=self._font_family, size=self._font_size, weight="bold")
         self._default_char_width = self.default_font.measure("x")
         self._mono_char_width = self.mono_font.measure("0")
 
@@ -93,6 +94,10 @@ class CSVViewer(tk.Tk):
         self.col_types = {}
         self.selected_cell = {"row": None, "col": None}
 
+        # SQLite state
+        self._sqlite_tables = []
+        self._sqlite_current_table = None
+
         # Virtual grid
         self.row_height = 25
         self.col_widths = {}
@@ -102,10 +107,29 @@ class CSVViewer(tk.Tk):
         self._redraw_job = None
         self._gutter_width = 50
 
+        # Vertical scroll position (not canvas-based — we manage it ourselves)
+        self._first_row = 0
+
+        # Pool: items at FIXED screen positions. Slot i always sits at
+        # y = i * row_height. Scrolling only changes text content.
+        self._pool_rows = 0
+        self._pool_cols = 0
+        self._pool_stripes = []   # [slot] -> rect id
+        self._pool_sel = None     # single rect id
+        self._pool_texts = []     # [slot][col] -> text id
+        self._pool_vlines = []    # [slot][col] -> line id
+        self._pool_hlines = []    # [slot] -> line id
+        # Gutter pool (same approach)
+        self._gpool_rows = 0
+        self._gpool_stripes = []
+        self._gpool_texts = []
+        self._gpool_hlines = []
+
         # Threads
         self.sort_thread = None
         self.filter_thread = None
         self.auto_fit_thread = None
+        self._load_thread = None
 
         # Column resizing state
         self.resizing_col_index = None
@@ -126,11 +150,14 @@ class CSVViewer(tk.Tk):
     # ================================================================
 
     def _load_config(self):
+        self._recent_files = []
         try:
             with open(CONFIG_PATH, "r") as f:
-                geo = json.load(f).get("geometry")
+                cfg = json.load(f)
+            geo = cfg.get("geometry")
             if geo:
                 self.geometry(geo)
+                self._recent_files = cfg.get("recent", [])
                 return
         except Exception:
             pass
@@ -141,9 +168,27 @@ class CSVViewer(tk.Tk):
     def _save_config(self):
         try:
             with open(CONFIG_PATH, "w") as f:
-                json.dump({"geometry": self.geometry()}, f)
+                json.dump({"geometry": self.geometry(),
+                           "recent": self._recent_files[:10]}, f)
         except Exception:
             pass
+
+    def _add_recent(self, path):
+        path = os.path.abspath(path)
+        if path in self._recent_files:
+            self._recent_files.remove(path)
+        self._recent_files.insert(0, path)
+        self._recent_files = self._recent_files[:10]
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        self._recent_menu.delete(0, "end")
+        for path in self._recent_files:
+            label = os.path.basename(path)
+            self._recent_menu.add_command(
+                label=label, command=lambda p=path: self.load_file_from_path(p))
+        if not self._recent_files:
+            self._recent_menu.add_command(label="(none)", state="disabled")
 
     # ================================================================
     # Theme
@@ -195,12 +240,15 @@ class CSVViewer(tk.Tk):
         file_menu = tk.Menu(menu_bar, tearoff=0)
         file_menu.add_command(label="Open...", command=self.open_file,
                               accelerator=f"{self.modifier}+O")
+        self._recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Open Recent", menu=self._recent_menu)
         file_menu.add_command(label="Export View...", command=self.export_filtered,
                               state="disabled")
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
         menu_bar.add_cascade(label="File", menu=file_menu)
         self.file_menu = file_menu
+        self._rebuild_recent_menu()
 
         self.edit_menu = tk.Menu(menu_bar, tearoff=0)
         self.edit_menu.add_command(label="Find/Filter...", command=self.find_data,
@@ -229,11 +277,20 @@ class CSVViewer(tk.Tk):
         self.bind("<Tab>", self._on_key_nav)
         self.bind("<Shift-Tab>", self._on_key_nav)
 
+        # Zoom
+        self.bind(f"<{self.modifier}-equal>", lambda e: self._zoom(1))
+        self.bind(f"<{self.modifier}-minus>", lambda e: self._zoom(-1))
+        self.bind(f"<{self.modifier}-0>", lambda e: self._zoom(0))
+
     # ================================================================
     # Widgets
     # ================================================================
 
     def _create_widgets(self):
+        # Tab bar for SQLite tables (hidden until needed)
+        self._tab_bar = tk.Frame(self, bg=self.HEADER_BG)
+        self._tab_buttons = []
+
         main_frame = tk.Frame(self, bg=self.BACKGROUND_COLOR)
         main_frame.pack(fill="both", expand=True)
         main_frame.grid_rowconfigure(1, weight=1)
@@ -261,10 +318,10 @@ class CSVViewer(tk.Tk):
                                  highlightthickness=0, bd=0)
         self.canvas.grid(row=1, column=1, sticky="nsew")
 
-        # Scrollbars
+        # Scrollbars — vertical is managed manually, horizontal is canvas-based
         self.vsb = ttk.Scrollbar(main_frame, orient="vertical", command=self.on_vscroll)
         self.hsb = ttk.Scrollbar(main_frame, orient="horizontal", command=self.on_hscroll)
-        self.canvas.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
+        self.canvas.configure(xscrollcommand=self.hsb.set)
         self.vsb.grid(row=1, column=2, sticky="ns")
         self.hsb.grid(row=2, column=1, sticky="ew")
 
@@ -303,21 +360,55 @@ class CSVViewer(tk.Tk):
 
     def _perform_redraw(self):
         self._redraw_job = None
-        self._redraw_header()
-        self._redraw_gutter()
-        self.redraw_canvas()
+        self._update_cells()
+
+    def _clamp_first_row(self):
+        # Use fully visible rows (not pool size which includes partial row buffer)
+        visible = max(1, int(self.canvas.winfo_height() / self.row_height))
+        max_first = max(0, self.total_rows - visible)
+        self._first_row = max(0, min(self._first_row, max_first))
+
+    def _update_scrollbar(self):
+        if self.total_rows <= 0:
+            self.vsb.set(0, 1)
+            return
+        top = self._first_row / self.total_rows
+        bottom = min(1.0, (self._first_row + self._pool_rows) / self.total_rows)
+        self.vsb.set(top, bottom)
 
     def on_vscroll(self, *args):
-        self.canvas.yview(*args)
-        self.gutter_canvas.yview(*args)
-        self._schedule_redraw()
+        if self.total_rows <= 0:
+            return
+        action = args[0]
+        if action == "moveto":
+            self._first_row = int(float(args[1]) * self.total_rows)
+        elif action == "scroll":
+            amount = int(args[1])
+            if args[2] == "pages":
+                amount *= max(1, self._pool_rows - 1)
+            self._first_row += amount
+        self._clamp_first_row()
+        self._update_scrollbar()
+        self._update_cells()
 
     def on_hscroll(self, *args):
         self.canvas.xview(*args)
         self.header_canvas.xview(*args)
-        self._schedule_redraw()
+        self._redraw_header()
 
     def _on_mousewheel(self, event):
+        # Ctrl/Cmd + scroll = zoom
+        ctrl = event.state & 0x4 if sys.platform != "darwin" else event.state & 0x8
+        if ctrl:
+            if sys.platform == "darwin":
+                direction = 1 if event.delta > 0 else -1
+            elif event.num == 4 or event.delta > 0:
+                direction = 1
+            else:
+                direction = -1
+            self._zoom(direction)
+            return
+
         if sys.platform == "darwin":
             delta = -int(event.delta)
         elif event.num == 5 or event.delta < 0:
@@ -326,9 +417,10 @@ class CSVViewer(tk.Tk):
             delta = -3
         else:
             return
-        self.canvas.yview_scroll(delta, "units")
-        self.gutter_canvas.yview_scroll(delta, "units")
-        self._schedule_redraw()
+        self._first_row += delta
+        self._clamp_first_row()
+        self._update_scrollbar()
+        self._update_cells()
 
     # ================================================================
     # Data loading
@@ -336,7 +428,9 @@ class CSVViewer(tk.Tk):
 
     def open_file(self):
         path = filedialog.askopenfilename(
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            filetypes=[("CSV files", "*.csv"),
+                       ("SQLite", "*.sqlite *.db *.sqlite3"),
+                       ("All files", "*.*")])
         if path:
             self.load_file_from_path(path)
 
@@ -346,11 +440,21 @@ class CSVViewer(tk.Tk):
             return
         self._reset_state()
         self.file_path = file_path
-        self.title(f"Fast CSV Viewer - {os.path.basename(file_path)}")
+        self._add_recent(file_path)
+        self.title(f"Table Viewer - {os.path.basename(file_path)}")
         self.status_bar.config(text=f"Opening {file_path}...")
-        threading.Thread(target=self._load_csv_data, daemon=True).start()
+
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in (".sqlite", ".db", ".sqlite3"):
+            self._load_thread = threading.Thread(target=self._load_sqlite_data, daemon=True)
+        else:
+            self._load_thread = threading.Thread(target=self._load_csv_data, daemon=True)
+        self._load_thread.start()
 
     def _reset_state(self):
+        self._sqlite_tables = []
+        self._sqlite_current_table = None
+        self._hide_table_tabs()
         self.original_data = pd.DataFrame()
         self.view_df = pd.DataFrame()
         self.column_names = []
@@ -362,6 +466,10 @@ class CSVViewer(tk.Tk):
         self.edit_menu.entryconfig("Find/Filter...", state="disabled")
         self.edit_menu.entryconfig("Clear Filter", state="disabled")
         self.file_menu.entryconfig(1, state="disabled")
+        self._first_row = 0
+        self._pool_rows = 0
+        self._pool_cols = 0
+        self._gpool_rows = 0
         self.canvas.delete("all")
         self.header_canvas.delete("all")
         self.gutter_canvas.delete("all")
@@ -411,12 +519,140 @@ class CSVViewer(tk.Tk):
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Error", f"Failed to read file: {e}"))
 
+    def _load_sqlite_data(self):
+        try:
+            conn = sqlite3.connect(self.file_path)
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()]
+            conn.close()
+            if not tables:
+                self.after(0, lambda: messagebox.showerror("Error", "No tables found in database."))
+                return
+
+            self._sqlite_tables = tables
+            if len(tables) > 1:
+                self.after(0, lambda: self._show_table_tabs(tables, tables[0]))
+
+            self._load_sqlite_table(tables[0])
+
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Error", f"Failed to read database: {e}"))
+
+    def _load_sqlite_table(self, table):
+        """Load a table with preview-then-full, all state on main thread."""
+        self._sqlite_current_table = table
+
+        self.after(0, lambda: self.title(
+            f"Table Viewer - {os.path.basename(self.file_path)} \u2014 {table}"))
+        self.after(0, lambda: self._update_tab_highlight(table))
+
+        try:
+            conn = sqlite3.connect(self.file_path)
+
+            # Stage 1: fast preview
+            preview = pd.read_sql(f"SELECT * FROM [{table}] LIMIT 200", conn)
+            col_names = preview.columns.tolist()
+            self._detect_column_types(preview)
+            self._estimate_col_widths(preview)
+
+            # Widen numeric columns using MAX values (instant on SQLite)
+            try:
+                num_cols = [col_names[i] for i, t in self.col_types.items()
+                            if t in ("int", "float")]
+                if num_cols:
+                    exprs = ", ".join(f"MAX([{c}])" for c in num_cols)
+                    row = conn.execute(f"SELECT {exprs} FROM [{table}]").fetchone()
+                    for c, val in zip(num_cols, row):
+                        if val is None:
+                            continue
+                        i = col_names.index(c)
+                        formatted = f"{int(val):,}" if self.col_types[i] == "int" else f"{val:,.2f}"
+                        w = self.mono_font.measure(formatted) + 15
+                        if w > self.col_widths.get(i, 0):
+                            self.col_widths[i] = min(w, 400)
+            except Exception:
+                pass
+
+            self._update_col_offsets()
+
+            def _apply_preview():
+                self.column_names = col_names
+                self.original_data = preview
+                self.view_df = preview
+                self.total_rows = len(preview)
+                self._first_row = 0
+                self._update_gutter_width()
+                self.setup_display()
+                self.status_bar.config(text="Loaded preview. Reading full table...")
+            self.after(0, _apply_preview)
+
+            # Stage 2: full load
+            full_data = pd.read_sql(f"SELECT * FROM [{table}]", conn)
+            conn.close()
+            self.after(0, lambda: self._finalize_load(full_data))
+
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Error", f"Failed to load table: {e}"))
+
+    def _show_table_tabs(self, tables, active):
+        """Show the tab bar with buttons for each table."""
+        for btn in self._tab_buttons:
+            btn.destroy()
+        self._tab_buttons = []
+
+        for t in tables:
+            btn = tk.Label(self._tab_bar, text=t, padx=12, pady=4, cursor="hand2")
+            btn.bind("<Button-1>", lambda e, name=t: self._on_tab_click(name))
+            btn.pack(side="left", padx=(0, 1))
+            self._tab_buttons.append(btn)
+
+        # Pack above main_frame but below menu/status
+        children = self.pack_slaves()
+        main_frame = [c for c in children if isinstance(c, tk.Frame) and c != self._tab_bar]
+        if main_frame:
+            self._tab_bar.pack(before=main_frame[0], fill="x", side="top")
+        else:
+            self._tab_bar.pack(fill="x", side="top")
+        self._update_tab_highlight(active)
+
+    def _hide_table_tabs(self):
+        self._tab_bar.pack_forget()
+        for btn in self._tab_buttons:
+            btn.destroy()
+        self._tab_buttons = []
+
+    def _update_tab_highlight(self, active):
+        for btn in self._tab_buttons:
+            if btn.cget("text") == active:
+                btn.config(bg=self.BACKGROUND_COLOR, fg=self.FOREGROUND_COLOR)
+            else:
+                btn.config(bg=self.HEADER_BG, fg=self.HEADER_FG)
+
+    def _on_tab_click(self, table):
+        if table == self._sqlite_current_table:
+            return
+        if self._load_thread and self._load_thread.is_alive():
+            return
+        self.status_bar.config(text=f"Loading table '{table}'...")
+        self._load_thread = threading.Thread(
+            target=self._load_sqlite_table, args=(table,), daemon=True)
+        self._load_thread.start()
+
     def _finalize_load(self, full_data):
         self.original_data = full_data
         self.view_df = full_data
         self.total_rows = len(full_data)
+        # Re-estimate widths from full data, only widen (no jarring shrink)
+        old_widths = dict(self.col_widths)
         self._estimate_col_widths(full_data)
-        self._update_col_offsets()
+        widened = False
+        for i in old_widths:
+            if i in self.col_widths and self.col_widths[i] < old_widths[i]:
+                self.col_widths[i] = old_widths[i]
+            elif i in self.col_widths and self.col_widths[i] > old_widths[i]:
+                widened = True
+        if widened:
+            self._update_col_offsets()
         self._update_gutter_width()
         self.features_ready = True
         self.edit_menu.entryconfig("Find/Filter...", state="normal")
@@ -447,7 +683,9 @@ class CSVViewer(tk.Tk):
 
     def _estimate_col_widths(self, df):
         self.col_widths = {}
-        sample = df.iloc[:200]
+        head = df.iloc[:100]
+        tail = df.iloc[-100:] if len(df) > 100 else df.iloc[:0]
+        sample = pd.concat([head, tail]).drop_duplicates()
         for i, col_name in enumerate(df.columns):
             header_w = self.header_font.measure(col_name) + 30
             col_type = self.col_types.get(i, "text")
@@ -508,29 +746,206 @@ class CSVViewer(tk.Tk):
         return self.mono_font if col_type in ("int", "float", "datetime") else self.default_font
 
     def _clip_text(self, text, col_idx, col_w):
-        char_w = self._mono_char_width if self.col_types.get(col_idx, "text") in ("int", "float", "datetime") else self._default_char_width
-        if len(text) * char_w <= col_w - 10:
+        max_w = col_w - 10
+        if max_w <= 0:
+            return ""
+        font = self._get_font(col_idx)
+        w = font.measure(text)
+        if w <= max_w:
             return text
-        max_chars = max(0, int((col_w - 10) / char_w) - 1)
-        return text[:max_chars] + "\u2026" if max_chars > 0 else ""
+        # Estimate truncation point proportionally
+        n = max(0, int(len(text) * max_w / w) - 1)
+        return text[:n] + "\u2026" if n > 0 else ""
 
     # ================================================================
     # Display
     # ================================================================
 
     def setup_display(self):
-        total_h = self.total_rows * self.row_height
         total_w = self._col_offsets[-1] if self._col_offsets else 0
-        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
+        canvas_h = max(self.canvas.winfo_height(), 100)
+        # Horizontal scrolling is canvas-based; vertical is manual
+        self.canvas.configure(scrollregion=(0, 0, total_w, canvas_h))
         self.header_canvas.configure(scrollregion=(0, 0, total_w, 30))
-        self.gutter_canvas.configure(scrollregion=(0, 0, self._gutter_width, total_h))
-        self._perform_redraw()
+        # Force pool rebuild
+        self._pool_rows = 0
+        self._pool_cols = 0
+        self._gpool_rows = 0
+        self._clamp_first_row()
+        self._update_scrollbar()
+        self._redraw_header()
+        self._update_cells()
         self.deiconify()
         self.lift()
 
     # ================================================================
-    # Rendering
+    # Pool management
     # ================================================================
+
+    def _rebuild_pool(self, n_rows, n_cols):
+        """Create items at fixed screen positions. Called on resize or data change."""
+        self.canvas.delete("all")
+        self._pool_rows = n_rows
+        self._pool_cols = n_cols
+        total_w = self._col_offsets[-1] if len(self._col_offsets) > 1 else 0
+
+        # Stripes at fixed y — use large width so they always fill the canvas
+        stripe_w = max(total_w, self.canvas.winfo_width(), 4000)
+        self._pool_stripes = []
+        for slot in range(n_rows):
+            y = slot * self.row_height
+            self._pool_stripes.append(
+                self.canvas.create_rectangle(0, y, stripe_w, y + self.row_height,
+                                              fill="", outline="", state="hidden"))
+
+        # Selection rect
+        self._pool_sel = self.canvas.create_rectangle(
+            0, 0, 0, 0, fill=self.SELECTION_COLOR, outline="", state="hidden")
+
+        # Grid lines and text at fixed positions
+        self._pool_vlines = []
+        self._pool_hlines = []
+        self._pool_texts = []
+        for slot in range(n_rows):
+            y = slot * self.row_height
+            row_vl = []
+            row_txt = []
+            for col in range(n_cols):
+                col_x = self._col_offsets[col]
+                col_w = self.col_widths.get(col, 100)
+                col_right = col_x + col_w
+
+                row_vl.append(self.canvas.create_line(
+                    col_right, y, col_right, y + self.row_height,
+                    fill=self.GRID_LINE_COLOR, state="hidden"))
+
+                align = self.col_alignments.get(col, "w")
+                if align == "e":
+                    tx, anchor = col_x + col_w - 5, "e"
+                else:
+                    tx, anchor = col_x + 5, "w"
+                row_txt.append(self.canvas.create_text(
+                    tx, y + self.row_height / 2, text="", anchor=anchor,
+                    font=self._get_font(col), fill=self.FOREGROUND_COLOR, state="hidden"))
+
+            self._pool_vlines.append(row_vl)
+            self._pool_texts.append(row_txt)
+            self._pool_hlines.append(self.canvas.create_line(
+                0, y + self.row_height, total_w, y + self.row_height,
+                fill=self.GRID_LINE_COLOR, state="hidden"))
+
+    def _rebuild_gutter_pool(self, n_rows):
+        """Create gutter items at fixed screen positions."""
+        self.gutter_canvas.delete("all")
+        self._gpool_rows = n_rows
+        gw = self._gutter_width
+
+        self._gpool_stripes = []
+        self._gpool_texts = []
+        self._gpool_hlines = []
+        for slot in range(n_rows):
+            y = slot * self.row_height
+            self._gpool_stripes.append(
+                self.gutter_canvas.create_rectangle(0, y, gw, y + self.row_height,
+                                                     fill="", outline="", state="hidden"))
+            self._gpool_texts.append(
+                self.gutter_canvas.create_text(gw - 8, y + self.row_height / 2,
+                                                text="", anchor="e", font=self.mono_font,
+                                                fill=self.FOREGROUND_COLOR, state="hidden"))
+            self._gpool_hlines.append(
+                self.gutter_canvas.create_line(0, y + self.row_height, gw, y + self.row_height,
+                                                fill=self.GRID_LINE_COLOR, state="hidden"))
+
+    # ================================================================
+    # Rendering — only text/fill changes, no coords
+    # ================================================================
+
+    def _update_cells(self):
+        """Update cell content for current scroll position. No coords calls."""
+        if not self.column_names or self.total_rows == 0:
+            return
+
+        canvas_h = self.canvas.winfo_height()
+        if canvas_h <= 1:
+            return
+
+        n_cols = len(self.column_names)
+        n_rows = int(canvas_h / self.row_height) + 2
+
+        if n_rows > self._pool_rows or n_cols != self._pool_cols:
+            self._rebuild_pool(n_rows, n_cols)
+        if n_rows > self._gpool_rows:
+            self._rebuild_gutter_pool(n_rows)
+
+        # Batch data access
+        end_row = min(self._first_row + self._pool_rows, len(self.view_df))
+        visible_count = max(0, end_row - self._first_row)
+        if visible_count > 0:
+            batch = self.view_df.iloc[self._first_row:end_row]
+            batch_vals = batch.values
+            batch_index = batch.index
+        else:
+            batch_vals = []
+            batch_index = []
+
+        sel_row = self.selected_cell["row"]
+        sel_col = self.selected_cell["col"]
+        sel_slot = None
+
+        # --- Main canvas ---
+        c = self.canvas
+        for slot in range(self._pool_rows):
+            if slot >= visible_count:
+                c.itemconfig(self._pool_stripes[slot], state="hidden")
+                c.itemconfig(self._pool_hlines[slot], state="hidden")
+                for pc in range(self._pool_cols):
+                    c.itemconfig(self._pool_texts[slot][pc], state="hidden")
+                    c.itemconfig(self._pool_vlines[slot][pc], state="hidden")
+                continue
+
+            data_row = self._first_row + slot
+            fill = self.STRIPE_COLOR if data_row % 2 == 0 else ""
+            c.itemconfig(self._pool_stripes[slot], fill=fill, state="normal")
+            c.itemconfig(self._pool_hlines[slot], state="normal")
+
+            row_vals = batch_vals[slot]
+            for pc in range(self._pool_cols):
+                col_w = self.col_widths.get(pc, 100)
+                display = self._clip_text(self._format_cell(pc, row_vals[pc]), pc, col_w)
+                c.itemconfig(self._pool_texts[slot][pc], text=display, state="normal")
+                c.itemconfig(self._pool_vlines[slot][pc], state="normal")
+
+            if data_row == sel_row:
+                sel_slot = slot
+
+        # Selection
+        if sel_slot is not None and sel_col is not None:
+            y = sel_slot * self.row_height
+            sx = self._col_offsets[sel_col]
+            sw = self.col_widths.get(sel_col, 100)
+            c.coords(self._pool_sel, sx, y, sx + sw, y + self.row_height)
+            c.itemconfig(self._pool_sel, state="normal")
+            c.tag_raise(self._pool_sel)
+            for pc in range(self._pool_cols):
+                c.tag_raise(self._pool_texts[sel_slot][pc])
+        else:
+            c.itemconfig(self._pool_sel, state="hidden")
+
+        # --- Gutter ---
+        gc = self.gutter_canvas
+        for slot in range(self._gpool_rows):
+            if slot >= visible_count:
+                gc.itemconfig(self._gpool_stripes[slot], state="hidden")
+                gc.itemconfig(self._gpool_texts[slot], state="hidden")
+                gc.itemconfig(self._gpool_hlines[slot], state="hidden")
+                continue
+
+            data_row = self._first_row + slot
+            fill = self.STRIPE_COLOR if data_row % 2 == 0 else ""
+            gc.itemconfig(self._gpool_stripes[slot], fill=fill, state="normal")
+            gc.itemconfig(self._gpool_hlines[slot], state="normal")
+            row_num = batch_index[slot] + 1
+            gc.itemconfig(self._gpool_texts[slot], text=f"{row_num:,}", state="normal")
 
     def _redraw_header(self):
         self.header_canvas.delete("all")
@@ -563,109 +978,12 @@ class CSVViewer(tk.Tk):
             line_x = col_x + col_w
             self.header_canvas.create_line(line_x, 4, line_x, h - 4, fill=self.GRID_LINE_COLOR)
 
-        # Gutter header (static content, cheap to redraw)
+        # Gutter header
         self.gutter_header.delete("all")
         self.gutter_header.create_text(self._gutter_width - 8, h / 2, text="#",
                                         anchor="e", font=self.header_font, fill=self.HEADER_FG)
         self.gutter_header.create_line(self._gutter_width - 1, 0,
                                         self._gutter_width - 1, h, fill=self.GRID_LINE_COLOR)
-
-    def _redraw_gutter(self):
-        self.gutter_canvas.delete("all")
-        if self.view_df.empty or self.total_rows == 0:
-            return
-
-        y_top = self.gutter_canvas.yview()[0]
-        start_row = max(0, int(y_top * self.total_rows))
-        visible = int(self.gutter_canvas.winfo_height() / self.row_height) + 2
-        gw = self._gutter_width
-
-        for i in range(min(visible, self.total_rows - start_row)):
-            data_row = start_row + i
-            if data_row >= len(self.view_df):
-                break
-            y = data_row * self.row_height
-
-            if data_row % 2 == 0:
-                self.gutter_canvas.create_rectangle(0, y, gw, y + self.row_height,
-                                                     fill=self.STRIPE_COLOR, outline="")
-
-            row_num = self.view_df.index[data_row] + 1
-            self.gutter_canvas.create_text(gw - 8, y + self.row_height / 2,
-                                            text=f"{row_num:,}", anchor="e",
-                                            font=self.mono_font, fill=self.FOREGROUND_COLOR)
-            self.gutter_canvas.create_line(0, y + self.row_height, gw, y + self.row_height,
-                                            fill=self.GRID_LINE_COLOR)
-
-    def redraw_canvas(self, event=None):
-        self.canvas.delete("all")
-        if not self.column_names or self.total_rows == 0:
-            return
-
-        canvas_w = self.canvas.winfo_width()
-        if canvas_w <= 1:
-            return
-
-        y_top, y_bottom = self.canvas.yview()
-        start_row = max(0, int(y_top * self.total_rows))
-        end_row = min(self.total_rows, int(y_bottom * self.total_rows) + 2)
-
-        x_left_frac, x_right_frac = self.canvas.xview()
-        total_w = self._col_offsets[-1]
-        if total_w <= 0:
-            return
-        x_left_px = x_left_frac * total_w
-        x_right_px = x_right_frac * total_w + 20
-
-        sel_row = self.selected_cell["row"]
-        sel_col = self.selected_cell["col"]
-
-        visible_slice = self.view_df.iloc[start_row:end_row]
-
-        for i, row_vals in enumerate(visible_slice.values):
-            data_row = start_row + i
-            y = data_row * self.row_height
-
-            # Row stripe
-            if data_row % 2 == 0:
-                self.canvas.create_rectangle(0, y, total_w, y + self.row_height,
-                                              fill=self.STRIPE_COLOR, outline="")
-
-            # Selection
-            if data_row == sel_row and sel_col is not None:
-                sx = self._col_offsets[sel_col]
-                sw = self.col_widths.get(sel_col, 100)
-                self.canvas.create_rectangle(sx, y, sx + sw, y + self.row_height,
-                                              fill=self.SELECTION_COLOR, outline="")
-
-            # Cells
-            for col_idx in range(len(self.column_names)):
-                col_x = self._col_offsets[col_idx]
-                col_w = self.col_widths.get(col_idx, 100)
-                col_right = col_x + col_w
-
-                if col_right < x_left_px or col_x > x_right_px:
-                    continue
-
-                display = self._clip_text(
-                    self._format_cell(col_idx, row_vals[col_idx]), col_idx, col_w)
-
-                align = self.col_alignments.get(col_idx, "w")
-                if align == "e":
-                    tx, anchor = col_x + col_w - 5, "e"
-                else:
-                    tx, anchor = col_x + 5, "w"
-
-                self.canvas.create_text(tx, y + self.row_height / 2,
-                                         text=display, anchor=anchor,
-                                         font=self._get_font(col_idx),
-                                         fill=self.FOREGROUND_COLOR)
-
-                self.canvas.create_line(col_right, y, col_right, y + self.row_height,
-                                         fill=self.GRID_LINE_COLOR)
-
-            self.canvas.create_line(0, y + self.row_height, total_w, y + self.row_height,
-                                     fill=self.GRID_LINE_COLOR)
 
     # ================================================================
     # Sorting
@@ -753,9 +1071,8 @@ class CSVViewer(tk.Tk):
         self.view_df = self.original_data
         self.total_rows = len(self.original_data)
         self.selected_cell = {"row": None, "col": None}
+        self._first_row = 0
         self._update_gutter_width()
-        self.canvas.yview_moveto(0)
-        self.gutter_canvas.yview_moveto(0)
         self.status_bar.config(text="Filter cleared.")
         self.setup_display()
 
@@ -811,20 +1128,16 @@ class CSVViewer(tk.Tk):
         if self.total_rows <= 0:
             return
 
-        y_top, y_bottom = self.canvas.yview()
-        row_frac = row / self.total_rows
-        visible_frac = y_bottom - y_top
-        row_size = 1.0 / self.total_rows
+        # Vertical — adjust _first_row
+        visible = max(1, self._pool_rows - 1)
+        if row < self._first_row:
+            self._first_row = row
+        elif row >= self._first_row + visible:
+            self._first_row = row - visible + 1
+        self._clamp_first_row()
+        self._update_scrollbar()
 
-        if row_frac < y_top:
-            target = row_frac
-            self.canvas.yview_moveto(target)
-            self.gutter_canvas.yview_moveto(target)
-        elif row_frac + row_size > y_bottom:
-            target = max(0, row_frac + row_size - visible_frac)
-            self.canvas.yview_moveto(target)
-            self.gutter_canvas.yview_moveto(target)
-
+        # Horizontal — still canvas-based
         total_w = self._col_offsets[-1]
         if total_w <= 0:
             return
@@ -848,11 +1161,11 @@ class CSVViewer(tk.Tk):
                                             f"Row (1 - {self.total_rows}):",
                                             parent=self, minvalue=1, maxvalue=self.total_rows)
         if line_num:
-            frac = max(0.0, min((line_num - 1) / max(self.total_rows, 1), 1.0 - 1e-9))
-            self.canvas.yview_moveto(frac)
-            self.gutter_canvas.yview_moveto(frac)
+            self._first_row = line_num - 1
+            self._clamp_first_row()
+            self._update_scrollbar()
             self.selected_cell = {"row": line_num - 1, "col": 0}
-            self._schedule_redraw()
+            self._update_cells()
 
     # ================================================================
     # Selection & clipboard
@@ -860,8 +1173,8 @@ class CSVViewer(tk.Tk):
 
     def _on_cell_click(self, event):
         canvas_x = self.canvas.canvasx(event.x)
-        canvas_y = self.canvas.canvasy(event.y)
-        row = int(canvas_y // self.row_height)
+        slot = int(event.y // self.row_height)
+        row = self._first_row + slot
         col_idx = bisect.bisect_right(self._col_offsets, canvas_x) - 1
 
         if row < len(self.view_df) and 0 <= col_idx < len(self.column_names):
@@ -938,16 +1251,22 @@ class CSVViewer(tk.Tk):
         self.col_widths[self.resizing_col_index] = new_w
         self._update_col_offsets()
         total_w = self._col_offsets[-1]
-        total_h = self.total_rows * self.row_height
-        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
+        canvas_h = max(self.canvas.winfo_height(), 100)
+        self.canvas.configure(scrollregion=(0, 0, total_w, canvas_h))
         self.header_canvas.configure(scrollregion=(0, 0, total_w, 30))
-        self._schedule_redraw()
+        # Only redraw header during drag (cheap). Pool rebuilds on release.
+        self._redraw_header()
 
     def _on_header_release(self, event):
         if self.resizing_col_index is not None:
             self.resizing_col_index = None
             self.header_canvas.config(cursor="")
-            self._perform_redraw()
+            # Rebuild pool now that column positions are final
+            self._pool_rows = 0
+            self._pool_cols = 0
+            self._gpool_rows = 0
+            self._redraw_header()
+            self._update_cells()
         elif self.potential_sort_click:
             idx = bisect.bisect_right(self._col_offsets, self._potential_sort_x) - 1
             if 0 <= idx < len(self.column_names):
@@ -976,12 +1295,10 @@ class CSVViewer(tk.Tk):
         """Open filter dialog with column pre-selected."""
         if not self.features_ready or (self.filter_thread and self.filter_thread.is_alive()):
             return
-        dlg = FilterDialog(self, self.column_names)
+        dlg = FilterDialog(self, self.column_names,
+                           default_column=self.column_names[col_index])
         if dlg.result:
             term, column, use_regex = dlg.result
-            # If user didn't pick a specific column, use the one they right-clicked
-            if column is None:
-                column = self.column_names[col_index]
             self.status_bar.config(text=f"Filtering for '{term}'...")
             self.filter_thread = threading.Thread(
                 target=self._perform_filter, args=(term, column, use_regex), daemon=True)
@@ -1039,7 +1356,26 @@ class CSVViewer(tk.Tk):
     # ================================================================
 
     def show_about(self):
-        messagebox.showinfo("About", "Fast CSV Viewer\nOptimized for large files.")
+        messagebox.showinfo("About", "Table Viewer\nOptimized for large files.")
+
+    def _zoom(self, direction):
+        """direction: 1=in, -1=out, 0=reset."""
+        if direction == 0:
+            self._font_size = 10
+        else:
+            self._font_size = max(6, min(24, self._font_size + direction))
+        self.default_font.configure(size=self._font_size)
+        self.mono_font.configure(size=self._font_size)
+        self.header_font.configure(size=self._font_size)
+        self._default_char_width = self.default_font.measure("x")
+        self._mono_char_width = self.mono_font.measure("0")
+        self.row_height = self.default_font.metrics("linespace") + 8
+
+        if self.column_names:
+            self._estimate_col_widths(self.view_df)
+            self._update_col_offsets()
+            self._update_gutter_width()
+            self.setup_display()
 
     def _on_close(self):
         self._save_config()
