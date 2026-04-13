@@ -32,6 +32,6 @@ Or `make run` to launch.
 ## Test data
 
 ```
-python generate_test_csv.py test.csv 100000
-python generate_test_sqlite.py test.db 100000
+python scripts/generate_test_csv.py test.csv 100000
+python scripts/generate_test_sqlite.py test.db 100000
 ```
