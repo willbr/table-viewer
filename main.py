@@ -333,6 +333,11 @@ class CSVViewer(tk.Tk):
         # Bindings
         self.canvas.bind("<Configure>", lambda e: self._schedule_redraw())
         self.canvas.bind("<Button-1>", self._on_cell_click)
+        if sys.platform == "darwin":
+            self.canvas.bind("<Button-2>", self._on_cell_right_click)
+            self.canvas.bind("<Control-Button-1>", self._on_cell_right_click)
+        else:
+            self.canvas.bind("<Button-3>", self._on_cell_right_click)
 
         for cvs in (self.canvas, self.gutter_canvas):
             cvs.bind("<MouseWheel>", self._on_mousewheel)
@@ -1183,6 +1188,23 @@ class CSVViewer(tk.Tk):
             self.selected_cell = {"row": None, "col": None}
         self._schedule_redraw()
 
+    def _on_cell_right_click(self, event):
+        # Select the cell under cursor first
+        canvas_x = self.canvas.canvasx(event.x)
+        slot = int(event.y // self.row_height)
+        row = self._first_row + slot
+        col_idx = bisect.bisect_right(self._col_offsets, canvas_x) - 1
+
+        if row >= len(self.view_df) or not (0 <= col_idx < len(self.column_names)):
+            return
+        self.selected_cell = {"row": row, "col": col_idx}
+        self._schedule_redraw()
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Copy Cell", command=self.copy_selection)
+        menu.add_command(label="Copy Row as JSON", command=self.copy_row_json)
+        menu.tk_popup(event.x_root, event.y_root)
+
     def copy_selection(self):
         sel = self.selected_cell
         if sel["row"] is not None and sel["col"] is not None:
@@ -1191,6 +1213,19 @@ class CSVViewer(tk.Tk):
                 self.clipboard_clear()
                 self.clipboard_append(str(value))
                 self.status_bar.config(text="Copied to clipboard.")
+            except IndexError:
+                pass
+
+    def copy_row_json(self):
+        sel = self.selected_cell
+        if sel["row"] is not None:
+            try:
+                row = self.view_df.iloc[sel["row"]]
+                obj = {k: v if not pd.isna(v) else None for k, v in row.items()}
+                text = json.dumps(obj, indent=2, default=str)
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                self.status_bar.config(text="Copied row as JSON.")
             except IndexError:
                 pass
 
