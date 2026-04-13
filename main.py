@@ -17,7 +17,7 @@ try:
 except Exception:
     pass
 
-CONFIG_PATH = os.path.expanduser("~/.csv-viewer.json")
+CONFIG_PATH = os.path.expanduser("~/.table-viewer.json")
 
 
 class FilterDialog(tk.Toplevel):
@@ -64,7 +64,7 @@ class FilterDialog(tk.Toplevel):
         self.destroy()
 
 
-class CSVViewer(tk.Tk):
+class TableViewer(tk.Tk):
     """A fast CSV viewer with virtualized canvas rendering and two-stage loading."""
 
     def __init__(self):
@@ -470,7 +470,7 @@ class CSVViewer(tk.Tk):
         self.last_press_col = None
         self.edit_menu.entryconfig("Find/Filter...", state="disabled")
         self.edit_menu.entryconfig("Clear Filter", state="disabled")
-        self.file_menu.entryconfig(1, state="disabled")
+        self.file_menu.entryconfig("Export View...", state="disabled")
         self._first_row = 0
         self._pool_rows = 0
         self._pool_cols = 0
@@ -662,7 +662,7 @@ class CSVViewer(tk.Tk):
         self.features_ready = True
         self.edit_menu.entryconfig("Find/Filter...", state="normal")
         self.edit_menu.entryconfig("Clear Filter", state="normal")
-        self.file_menu.entryconfig(1, state="normal")
+        self.file_menu.entryconfig("Export View...", state="normal")
         self.setup_display()
         self.status_bar.config(text=f"Ready. {self.total_rows:,} rows.")
 
@@ -1423,7 +1423,7 @@ if __name__ == "__main__":
         if not arg.startswith("-"):
             file_to_open = arg
 
-    app = CSVViewer()
+    app = TableViewer()
     if file_to_open:
         app.load_file_from_path(file_to_open)
     app.mainloop()

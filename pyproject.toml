@@ -1,7 +1,7 @@
 [project]
-name = "csv-viewer"
-version = "0.1.0"
-description = "Add your description here"
+name = "table-viewer"
+version = "0.2.0"
+description = "A fast desktop viewer for CSV and SQLite files"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
